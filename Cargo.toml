@@ -1,0 +1,8 @@
+[package]
+name = "cargo-depdep"
+version = "0.1.0"
+edition = "2024"
+description = "Compare the dependencies in Cargo.lock across Git revisions"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
