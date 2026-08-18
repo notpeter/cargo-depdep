@@ -323,6 +323,11 @@ fn print_diff(old: &Packages, new: &Packages, pretty: bool) {
         ]);
     }
 
+    if rows.is_empty() {
+        eprintln!("no changes");
+        return;
+    }
+
     if pretty {
         print_pretty(&rows);
     } else {
