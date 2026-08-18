@@ -17,12 +17,10 @@ cargo install --git https://github.com/notpeter/cargo-depdep
 ```shell
 Compare the working tree's Cargo.lock with another Git revision.
 
-Usage: cargo depdep [OPTIONS] [REV]
-
-Arguments:
-  [REV]  Git rev to compare against [default: main or repo default branch]
+Usage: cargo depdep [OPTIONS]
 
 Options:
+  --rev <REV>  Git rev to compare against [default: main or repo default branch]
   --pretty  Align the columns for a nicely formatted ASCII table
   -h, --help    Print help
 ```

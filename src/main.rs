@@ -68,28 +68,38 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
     let mut revision = None;
     let mut pretty = false;
 
-    for arg in args {
+    while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-h" | "--help") => {
                 println!(
                     "Compare the working tree's Cargo.lock with another Git revision.\n\n\
-                     Usage: cargo depdep [OPTIONS] [REV]\n\n\
-                     Arguments:\n  [REV]  Git rev to compare against [default: main or repo default branch]\n\n\
+                     Usage: cargo depdep [OPTIONS]\n\n\
                      Options:\n  \
+                       --rev <REV>  Git rev to compare against [default: main or repo default branch]\n  \
                        --pretty  Align the columns for a nicely formatted ASCII table\n  \
                    -h, --help    Print help"
                 );
                 process::exit(0);
             }
             Some("--pretty") => pretty = true,
-            _ => {
+            Some("--rev" | "--branch") => {
                 if revision.is_some() {
-                    return Err(Error::Usage("expected at most one revision".into()));
+                    return Err(Error::Usage("--rev may only be used once".into()));
                 }
+                let value = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--rev requires a value".into()))?;
                 revision = Some(
-                    arg.into_string()
+                    value
+                        .into_string()
                         .map_err(|_| Error::Usage("the revision must be valid UTF-8".into()))?,
                 );
+            }
+            _ => {
+                return Err(Error::Usage(format!(
+                    "unexpected argument {:?}",
+                    arg.to_string_lossy()
+                )));
             }
         }
     }

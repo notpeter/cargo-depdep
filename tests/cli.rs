@@ -52,7 +52,7 @@ fn compares_the_working_lockfile_with_a_git_revision() {
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-depdep"))
-        .args(["depdep", "HEAD"])
+        .args(["depdep", "--rev", "HEAD"])
         .current_dir(&repository)
         .output()
         .unwrap();
@@ -72,7 +72,7 @@ fn compares_the_working_lockfile_with_a_git_revision() {
     );
 
     let pretty = Command::new(env!("CARGO_BIN_EXE_cargo-depdep"))
-        .args(["depdep", "--pretty", "HEAD"])
+        .args(["depdep", "--pretty", "--rev", "HEAD"])
         .current_dir(&repository)
         .output()
         .unwrap();
