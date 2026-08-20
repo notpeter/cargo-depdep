@@ -24,7 +24,12 @@ fn compares_the_working_lockfile_with_a_git_revision() {
         ]),
     )
     .unwrap();
-    git(&repository, &["add", "Cargo.lock"]);
+    fs::write(
+        repository.join("Cargo.toml"),
+        manifest(&["foo", "removed", "unchanged"]),
+    )
+    .unwrap();
+    git(&repository, &["add", "Cargo.lock", "Cargo.toml"]);
     git(
         &repository,
         &[
@@ -48,6 +53,11 @@ fn compares_the_working_lockfile_with_a_git_revision() {
             ("foo", "3.0.0"),
             ("unchanged", "1.2.3"),
         ]),
+    )
+    .unwrap();
+    fs::write(
+        repository.join("Cargo.toml"),
+        manifest(&["added", "foo", "unchanged"]),
     )
     .unwrap();
 
@@ -114,6 +124,15 @@ fn lockfile(packages: &[(&str, &str)]) -> String {
         contents.push_str(&format!(
             "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"
         ));
+    }
+    contents
+}
+
+fn manifest(dependencies: &[&str]) -> String {
+    let mut contents =
+        String::from("[package]\nname = \"test\"\nversion = \"0.0.0\"\n\n[dependencies]\n");
+    for dependency in dependencies {
+        contents.push_str(&format!("{dependency} = \"*\"\n"));
     }
     contents
 }
