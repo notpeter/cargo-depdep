@@ -65,27 +65,27 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
             label: project.lockfile.display().to_string(),
             message,
         })?;
-    let old_direct = options
-        .ecosystem
-        .parse_manifest(&old_manifest)
-        .map_err(|message| Error::File {
-            label: format!("{revision}:{}", manifest_path.display()),
-            message,
-        })?;
-    let new_direct = options
-        .ecosystem
-        .parse_manifest(&new_manifest)
-        .map_err(|message| Error::File {
-            label: project.manifest.display().to_string(),
-            message,
-        })?;
+    let old_direct = direct_dependencies(
+        options.ecosystem,
+        &repository_root,
+        Some(&revision),
+        manifest_path,
+        &old_manifest,
+    )?;
+    let new_direct = direct_dependencies(
+        options.ecosystem,
+        &repository_root,
+        None,
+        manifest_path,
+        &new_manifest,
+    )?;
     let direct = old_direct.union(&new_direct).cloned().collect();
 
     print_diff(
         &old_packages,
         &new_packages,
         &direct,
-        options.transitive,
+        options.all,
         options.pretty,
         options.ecosystem.package_label(),
     );
@@ -131,7 +131,7 @@ impl Ecosystem {
 struct Options {
     ecosystem: Ecosystem,
     revision: Option<String>,
-    transitive: bool,
+    all: bool,
     pretty: bool,
 }
 
@@ -146,7 +146,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
 
     let mut revision = None;
     let mut pretty = false;
-    let mut transitive = false;
+    let mut all = false;
     let mut ecosystem = None;
 
     while let Some(arg) = args.next() {
@@ -158,14 +158,14 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
                      Arguments:\n  [ECOSYSTEM]  Package ecosystem: rust or npm [default: rust]\n\n\
                      Options:\n  \
                        --rev <REV>  Git rev to compare against [default: main or repo default branch]\n  \
-                       --transitive  Include transitive dependency changes\n  \
+                       --all  Include transitive dependency changes\n  \
                        --pretty  Align the columns for a nicely formatted ASCII table\n  \
                    -h, --help    Print help"
                 );
                 process::exit(0);
             }
             Some("--pretty") => pretty = true,
-            Some("--transitive") => transitive = true,
+            Some("--all") => all = true,
             Some("rust" | "npm") => {
                 if ecosystem.is_some() {
                     return Err(Error::Usage("expected at most one ecosystem".into()));
@@ -201,7 +201,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
     Ok(Options {
         ecosystem: ecosystem.unwrap_or(Ecosystem::Rust),
         revision,
-        transitive,
+        all,
         pretty,
     })
 }
@@ -442,51 +442,389 @@ fn add_package(
     Ok(())
 }
 
-fn parse_cargo_manifest(contents: &str) -> Result<BTreeSet<String>, String> {
-    let mut dependencies = BTreeSet::new();
-    let mut section = CargoManifestSection::Other;
+#[derive(Default)]
+struct CargoDependency {
+    package: Option<String>,
+    inherited: bool,
+}
 
+fn cargo_dependencies(contents: &str) -> Result<BTreeMap<String, CargoDependency>, String> {
+    let mut dependencies = BTreeMap::<String, CargoDependency>::new();
+    let mut section = CargoManifestSection::Other;
     for (index, line) in contents.lines().enumerate() {
         let line_number = index + 1;
         let line = strip_toml_comment(line).trim();
-        if line.is_empty() {
-            continue;
-        }
-
         if line.starts_with('[') && line.ends_with(']') {
             section = cargo_manifest_section(line, line_number)?;
             if let CargoManifestSection::Dependency { resolved } = &section {
-                dependencies.insert(resolved.clone());
+                dependencies.entry(resolved.clone()).or_default();
             }
             continue;
         }
-
         let Some((key, value)) = toml_assignment(line) else {
             continue;
         };
-        match &mut section {
+        let value = value.trim();
+        match &section {
             CargoManifestSection::Dependencies => {
                 let keys = split_toml_key(key, line_number)?;
-                let alias = keys
-                    .first()
-                    .ok_or_else(|| format!("line {line_number}: expected a dependency name"))?;
-                let name = inline_toml_string_field(value, "package", line_number)?
-                    .unwrap_or_else(|| alias.clone());
-                dependencies.insert(name);
+                let dependency = dependencies.entry(keys[0].clone()).or_default();
+                match keys.get(1).map(String::as_str) {
+                    Some("package") => {
+                        dependency.package = Some(parse_toml_string(value, line_number)?)
+                    }
+                    Some("workspace") => dependency.inherited = value == "true",
+                    None => {
+                        dependency.package =
+                            inline_toml_string_field(value, "package", line_number)?;
+                        dependency.inherited =
+                            inline_toml_field(value, "workspace", line_number)? == Some("true");
+                    }
+                    _ => {}
+                }
             }
             CargoManifestSection::Dependency { resolved } => {
-                if parse_toml_key(key, line_number)? == "package" {
-                    dependencies.remove(resolved);
-                    let name = parse_toml_string(value.trim(), line_number)?;
-                    dependencies.insert(name.clone());
-                    *resolved = name;
+                let dependency = dependencies.entry(resolved.clone()).or_default();
+                match parse_toml_key(key, line_number)?.as_str() {
+                    "package" => dependency.package = Some(parse_toml_string(value, line_number)?),
+                    "workspace" => dependency.inherited = value == "true",
+                    _ => {}
                 }
             }
             CargoManifestSection::Other => {}
         }
     }
-
     Ok(dependencies)
+}
+
+fn resolved_dependencies(
+    contents: &str,
+    workspace: &BTreeMap<String, CargoDependency>,
+) -> Result<BTreeSet<String>, String> {
+    cargo_dependencies(contents)?
+        .into_iter()
+        .map(|(alias, dependency)| {
+            let package = if dependency.inherited {
+                workspace
+                    .get(&alias)
+                    .ok_or_else(|| {
+                        format!(
+                            "inherited dependency {alias:?} missing from workspace.dependencies"
+                        )
+                    })?
+                    .package
+                    .clone()
+            } else {
+                dependency.package
+            };
+            Ok(package.unwrap_or(alias))
+        })
+        .collect()
+}
+
+// Read each side independently: workspace membership can change across revisions.
+struct ManifestSource<'a> {
+    root: &'a Path,
+    revision: Option<&'a str>,
+}
+
+impl ManifestSource<'_> {
+    fn read(&self, path: &Path) -> Result<String, Error> {
+        if let Some(revision) = self.revision {
+            file_at_revision(self.root, revision, path)
+        } else {
+            fs::read_to_string(self.root.join(path)).map_err(|source| Error::Io {
+                context: format!("could not read {}", self.root.join(path).display()),
+                source,
+            })
+        }
+    }
+
+    fn directories(&self, path: &Path) -> Result<Vec<String>, Error> {
+        if let Some(revision) = self.revision {
+            let object = if path.as_os_str().is_empty() {
+                revision.to_string()
+            } else {
+                format!("{revision}:{}", path.display())
+            };
+            let output = Command::new("git")
+                .args(["ls-tree", "-z", "--name-only", "-d", &object])
+                .current_dir(self.root)
+                .output()
+                .map_err(|source| Error::Io {
+                    context: "could not list workspace directories".into(),
+                    source,
+                })?;
+            if !output.status.success() {
+                return Err(Error::Git(command_error(&output.stderr)));
+            }
+            let names = String::from_utf8(output.stdout)
+                .map_err(|_| Error::Git("workspace directory is not valid UTF-8".into()))?;
+            Ok(names
+                .split('\0')
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect())
+        } else {
+            let entries = fs::read_dir(self.root.join(path)).map_err(|source| Error::Io {
+                context: format!("could not list {}", self.root.join(path).display()),
+                source,
+            })?;
+            let mut names = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|source| Error::Io {
+                    context: "could not read workspace directory entry".into(),
+                    source,
+                })?;
+                if entry.path().is_dir() {
+                    names.push(entry.file_name().into_string().map_err(|_| {
+                        Error::Usage("workspace directory is not valid UTF-8".into())
+                    })?);
+                }
+            }
+            Ok(names)
+        }
+    }
+
+    fn expand(&self, base: &Path, pattern: &str) -> Result<Vec<PathBuf>, Error> {
+        let mut paths = vec![base.to_path_buf()];
+        for part in pattern.split('/') {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            let mut next = Vec::new();
+            for path in paths {
+                if part == ".." {
+                    let mut parent = path;
+                    if !parent.pop() {
+                        return Err(Error::Usage(
+                            "workspace member is outside the repository".into(),
+                        ));
+                    }
+                    next.push(parent);
+                } else if part.contains(['*', '?', '[']) {
+                    for name in self.directories(&path)? {
+                        if glob_matches(part, &name) {
+                            next.push(path.join(name));
+                        }
+                    }
+                } else {
+                    next.push(path.join(part));
+                }
+            }
+            paths = next;
+        }
+        Ok(paths)
+    }
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    fn matches(pattern: &[char], value: &[char]) -> bool {
+        match pattern.first() {
+            None => value.is_empty(),
+            Some('*') => {
+                matches(&pattern[1..], value)
+                    || (!value.is_empty() && value[0] != '/' && matches(pattern, &value[1..]))
+            }
+            Some('?') => {
+                !value.is_empty() && value[0] != '/' && matches(&pattern[1..], &value[1..])
+            }
+            Some('[') => {
+                let Some(end) = pattern.iter().position(|c| *c == ']') else {
+                    return false;
+                };
+                if value.is_empty() || value[0] == '/' {
+                    return false;
+                }
+                let mut class = &pattern[1..end];
+                let negate = class.first() == Some(&'!');
+                if negate {
+                    class = &class[1..];
+                }
+                let mut found = false;
+                while !class.is_empty() {
+                    if class.len() >= 3 && class[1] == '-' {
+                        found |= class[0] <= value[0] && value[0] <= class[2];
+                        class = &class[3..];
+                    } else {
+                        found |= class[0] == value[0];
+                        class = &class[1..];
+                    }
+                }
+                found != negate && matches(&pattern[end + 1..], &value[1..])
+            }
+            Some(c) => value.first() == Some(c) && matches(&pattern[1..], &value[1..]),
+        }
+    }
+    matches(
+        &pattern.chars().collect::<Vec<_>>(),
+        &value.chars().collect::<Vec<_>>(),
+    )
+}
+
+#[derive(Default)]
+struct Workspace {
+    present: bool,
+    members: Vec<String>,
+    exclude: Vec<String>,
+    dependencies: BTreeMap<String, CargoDependency>,
+}
+
+fn parse_workspace(contents: &str) -> Result<Workspace, String> {
+    let mut workspace = Workspace::default();
+    let mut section = Vec::new();
+    let mut pending = String::new();
+    let mut dependency_manifest = String::new();
+    for (index, raw) in contents.lines().enumerate() {
+        let line = strip_toml_comment(raw).trim();
+        if pending.is_empty() && line.starts_with('[') && line.ends_with(']') {
+            section = split_toml_key(&line[1..line.len() - 1], index + 1)?;
+            if section.first().is_some_and(|key| key == "workspace") {
+                workspace.present = true;
+            }
+            if section.starts_with(&["workspace".into(), "dependencies".into()]) {
+                dependency_manifest.push_str("[dependencies");
+                if let Some(alias) = section.get(2) {
+                    dependency_manifest.push_str(&format!(".{alias:?}"));
+                }
+                dependency_manifest.push_str("]\n");
+            }
+            continue;
+        }
+        if section.starts_with(&["workspace".into(), "dependencies".into()]) {
+            dependency_manifest.push_str(line);
+            dependency_manifest.push('\n');
+        }
+        if section != ["workspace"] {
+            continue;
+        }
+        pending.push_str(line);
+        let Some((key, value)) = toml_assignment(&pending) else {
+            pending.clear();
+            continue;
+        };
+        let key = parse_toml_key(key, index + 1)?;
+        if key != "members" && key != "exclude" {
+            pending.clear();
+            continue;
+        }
+        if !value.trim_end().ends_with(']') {
+            continue;
+        }
+        let value = value
+            .trim()
+            .strip_prefix('[')
+            .and_then(|v| v.strip_suffix(']'))
+            .ok_or_else(|| format!("line {}: expected workspace array", index + 1))?;
+        let mut strings = Vec::new();
+        let mut quote = None;
+        let mut escaped = false;
+        let mut start = 0;
+        for (offset, c) in value.char_indices() {
+            match quote {
+                Some('"') if escaped => escaped = false,
+                Some('"') if c == '\\' => escaped = true,
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None if c == '"' || c == '\'' => quote = Some(c),
+                None if c == ',' => {
+                    strings.push(parse_toml_string(value[start..offset].trim(), index + 1)?);
+                    start = offset + 1;
+                }
+                _ => {}
+            }
+        }
+        if !value[start..].trim().is_empty() {
+            strings.push(parse_toml_string(value[start..].trim(), index + 1)?);
+        }
+        if key == "members" {
+            workspace.members = strings;
+        } else {
+            workspace.exclude = strings;
+        }
+        pending.clear();
+    }
+    if !pending.is_empty() {
+        return Err("unterminated workspace array".into());
+    }
+    workspace.dependencies = cargo_dependencies(&dependency_manifest)?;
+    Ok(workspace)
+}
+
+fn direct_dependencies(
+    ecosystem: Ecosystem,
+    root: &Path,
+    revision: Option<&str>,
+    manifest_path: &Path,
+    contents: &str,
+) -> Result<BTreeSet<String>, Error> {
+    let error = |message| Error::File {
+        label: revision.map_or_else(
+            || manifest_path.display().to_string(),
+            |rev| format!("{rev}:{}", manifest_path.display()),
+        ),
+        message,
+    };
+    if matches!(ecosystem, Ecosystem::Npm) {
+        return ecosystem.parse_manifest(contents).map_err(error);
+    }
+    let source = ManifestSource { root, revision };
+    let workspace = parse_workspace(contents).map_err(&error)?;
+    let base = manifest_path.parent().unwrap_or(Path::new(""));
+    if !workspace.present {
+        // A member invocation still needs its workspace's aliases for inheritance.
+        let mut parent = base.parent();
+        while let Some(directory) = parent {
+            let path = directory.join(CARGO_MANIFEST);
+            if let Ok(parent_contents) = source.read(&path) {
+                let workspace = parse_workspace(&parent_contents).map_err(&error)?;
+                if workspace.present {
+                    return resolved_dependencies(contents, &workspace.dependencies).map_err(error);
+                }
+            }
+            parent = directory.parent();
+        }
+        return parse_cargo_manifest(contents).map_err(error);
+    }
+    let mut direct = resolved_dependencies(contents, &workspace.dependencies).map_err(&error)?;
+    let mut manifests = BTreeSet::new();
+    for pattern in &workspace.members {
+        for member in source.expand(base, pattern)? {
+            let relative = member
+                .strip_prefix(base)
+                .unwrap_or(&member)
+                .to_string_lossy();
+            if !workspace
+                .exclude
+                .iter()
+                .any(|pattern| glob_matches(pattern.trim_end_matches('/'), &relative))
+            {
+                manifests.insert(member.join(CARGO_MANIFEST));
+            }
+        }
+    }
+    for path in manifests {
+        let member = source.read(&path)?;
+        direct.extend(
+            resolved_dependencies(&member, &workspace.dependencies).map_err(|message| {
+                Error::File {
+                    label: revision.map_or_else(
+                        || path.display().to_string(),
+                        |rev| format!("{rev}:{}", path.display()),
+                    ),
+                    message,
+                }
+            })?,
+        );
+    }
+    Ok(direct)
+}
+
+fn parse_cargo_manifest(contents: &str) -> Result<BTreeSet<String>, String> {
+    Ok(cargo_dependencies(contents)?
+        .into_iter()
+        .map(|(alias, dependency)| dependency.package.unwrap_or(alias))
+        .collect())
 }
 
 enum CargoManifestSection {
@@ -608,6 +946,16 @@ fn inline_toml_string_field(
     field: &str,
     line_number: usize,
 ) -> Result<Option<String>, String> {
+    inline_toml_field(value, field, line_number)?
+        .map(|value| parse_toml_string(value.trim(), line_number))
+        .transpose()
+}
+
+fn inline_toml_field<'a>(
+    value: &'a str,
+    field: &str,
+    line_number: usize,
+) -> Result<Option<&'a str>, String> {
     let value = value.trim();
     let Some(value) = value
         .strip_prefix('{')
@@ -644,7 +992,7 @@ fn inline_toml_string_field(
             continue;
         };
         if parse_toml_key(key, line_number)? == field {
-            return parse_toml_string(value.trim(), line_number).map(Some);
+            return Ok(Some(value.trim()));
         }
     }
     Ok(None)
@@ -1056,7 +1404,7 @@ fn print_diff(
             ("dependency changes", "them")
         };
         eprintln!(
-            "{hidden} additional transitive {dependency} not shown; use --transitive to show {pronoun}"
+            "{hidden} additional transitive {dependency} not shown; use --all to show {pronoun}"
         );
     }
 }
@@ -1160,6 +1508,131 @@ impl fmt::Display for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_dependencies_follow_members_on_each_side() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("depdep-workspace-{}-{nonce}", process::id()));
+        fs::create_dir_all(root.join("crates/old")).unwrap();
+        fs::create_dir_all(root.join("crates/excluded")).unwrap();
+        let manifest = r#"
+[workspace]
+members = [
+    "crates/*", # Includes both tracked and new members.
+]
+exclude = ["crates/excluded"]
+[workspace.dependencies]
+sdk = { package = "matrix-sdk", version = "*" }
+unused = "*"
+[workspace.dependencies.ruma_alias]
+package = "ruma"
+version = "*"
+[dependencies]
+root_only = "*"
+"#;
+        fs::write(root.join("Cargo.toml"), manifest).unwrap();
+        fs::write(
+            root.join("crates/old/Cargo.toml"),
+            "[dependencies]\nsdk.workspace = true\nremoved = \"*\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/excluded/Cargo.toml"),
+            "[dependencies]\nhidden = \"*\"\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "."]);
+        // A tree object is sufficient for historical reads; no test commits needed.
+        let revision = git(&["write-tree"]);
+        fs::remove_dir_all(root.join("crates/old")).unwrap();
+        fs::create_dir_all(root.join("crates/new")).unwrap();
+        let member = "[dependencies]\nsdk = { workspace = true }\n[dev-dependencies.ruma_alias]\nworkspace = true\n[build-dependencies]\nadded = \"*\"\n";
+        fs::write(root.join("crates/new/Cargo.toml"), member).unwrap();
+        let old = direct_dependencies(
+            Ecosystem::Rust,
+            &root,
+            Some(&revision),
+            Path::new("Cargo.toml"),
+            manifest,
+        )
+        .unwrap();
+        let new = direct_dependencies(
+            Ecosystem::Rust,
+            &root,
+            None,
+            Path::new("Cargo.toml"),
+            manifest,
+        )
+        .unwrap();
+        assert_eq!(
+            old,
+            BTreeSet::from(["matrix-sdk".into(), "removed".into(), "root_only".into()])
+        );
+        assert_eq!(
+            new,
+            BTreeSet::from([
+                "matrix-sdk".into(),
+                "ruma".into(),
+                "added".into(),
+                "root_only".into()
+            ])
+        );
+        let member_direct = direct_dependencies(
+            Ecosystem::Rust,
+            &root,
+            None,
+            Path::new("crates/new/Cargo.toml"),
+            member,
+        )
+        .unwrap();
+        assert_eq!(
+            member_direct,
+            BTreeSet::from(["matrix-sdk".into(), "ruma".into(), "added".into()])
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_globs_respect_path_boundaries() {
+        assert!(glob_matches("crates/*", "crates/foo"));
+        assert!(!glob_matches("crates/*", "crates/foo/bar"));
+        assert!(glob_matches("crate-[a-c]?", "crate-b1"));
+        assert!(!glob_matches("crate-[!a-c]?", "crate-b1"));
+    }
+
+    #[test]
+    fn resolves_inherited_names_without_counting_unused_workspace_entries() {
+        let workspace = parse_workspace("[workspace]\nmembers = []\n[workspace.dependencies]\nalias = { package = \"actual\", version = \"*\" }\nunused = \"*\"\n").unwrap();
+        let dependencies = resolved_dependencies("[target.'cfg(unix)'.dependencies]\nalias = { workspace = true }\n[dependencies]\nrenamed = { package = \"other\", version = \"*\" }\n", &workspace.dependencies).unwrap();
+        assert_eq!(
+            dependencies,
+            BTreeSet::from(["actual".into(), "other".into()])
+        );
+        assert!(
+            resolved_dependencies(
+                "[dependencies]\nmissing.workspace = true\n",
+                &workspace.dependencies
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn parses_and_groups_package_versions() {
