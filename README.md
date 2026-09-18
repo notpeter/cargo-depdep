@@ -21,10 +21,10 @@ Compare dependency lockfiles with another Git revision.
 Usage: cargo depdep [OPTIONS] [ECOSYSTEM]
 
 Arguments:
-  [ECOSYSTEM]  Package ecosystem: rust or npm [default: rust]
+  [ECOSYSTEM]  Package ecosystem: rust or npm [default: auto-detect]
 
 Options:
-  --rev <REV>  Git rev to compare against [default: main or repo default branch]
+  --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]
   --all  Include transitive dependency changes
   --pretty  Align the columns for a nicely formatted ASCII table
   -h, --help    Print help
@@ -32,7 +32,17 @@ Options:
 
 ### Compact output
 
-Rust is the default, so `cargo depdep` and `cargo depdep rust` are equivalent:
+The default revision is the remote-tracking branch pointed to by `origin/HEAD`,
+then `origin/main` or `origin/master`, then local `main` or `master`.
+Remote-tracking branches reflect the last fetch; run `git fetch origin` to update
+them without pulling. Use `--rev <REV>` to choose a revision explicitly.
+
+`cargo depdep` detects `Cargo.toml` and `package.json` from the current directory
+up to the repository root. If both are found, it compares both ecosystems in
+separate Rust and npm sections. Each detected ecosystem requires its lockfile.
+Pass `rust` or `npm` to compare only that ecosystem.
+
+For a Rust project:
 
 ```console
 # cargo depdep
@@ -42,7 +52,7 @@ Rust is the default, so `cargo depdep` and `cargo depdep rust` are equivalent:
 | syn | 1.0.109, 2.0.90 | 2.0.100 |
 ```
 
-For an npm project, pass `npm`:
+For an npm project, detection works automatically; you can also pass `npm`:
 
 ```console
 # cargo depdep npm

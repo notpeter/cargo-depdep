@@ -26,55 +26,104 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
         source,
     })?;
     let repository_root = git_repository_root(&current_dir)?;
-    let revision = match options.revision {
-        Some(revision) => revision,
+    let revision = match &options.revision {
+        Some(revision) => revision.clone(),
         None => default_revision(&repository_root),
     };
-    let project = find_project(&current_dir, &repository_root, options.ecosystem)?;
+    let ecosystems = match options.ecosystem {
+        Some(ecosystem) => vec![ecosystem],
+        None => [
+            (Ecosystem::Rust, CARGO_MANIFEST),
+            (Ecosystem::Npm, NPM_MANIFEST),
+        ]
+        .into_iter()
+        .filter(|(_, manifest)| find_file(&current_dir, &repository_root, manifest).is_some())
+        .map(|(ecosystem, _)| ecosystem)
+        .collect(),
+    };
+    if ecosystems.is_empty() {
+        return Err(Error::Usage(format!(
+            "could not find Cargo.toml or package.json between {} and {}",
+            current_dir.display(),
+            repository_root.display()
+        )));
+    }
+    let multiple = ecosystems.len() > 1;
+    for (index, ecosystem) in ecosystems.into_iter().enumerate() {
+        if multiple {
+            if index > 0 {
+                println!();
+            }
+            println!(
+                "## {}",
+                match ecosystem {
+                    Ecosystem::Rust => "Rust",
+                    Ecosystem::Npm => "npm",
+                }
+            );
+            println!();
+        }
+        compare_project(
+            &current_dir,
+            &repository_root,
+            &revision,
+            ecosystem,
+            &options,
+        )?;
+    }
+    Ok(())
+}
+
+fn compare_project(
+    current_dir: &Path,
+    repository_root: &Path,
+    revision: &str,
+    ecosystem: Ecosystem,
+    options: &Options,
+) -> Result<(), Error> {
+    let project = find_project(current_dir, repository_root, ecosystem)?;
     let lockfile_path = project
         .lockfile
-        .strip_prefix(&repository_root)
+        .strip_prefix(repository_root)
         .expect("the lockfile search stays inside the repository");
     let manifest_path = project
         .manifest
-        .strip_prefix(&repository_root)
+        .strip_prefix(repository_root)
         .expect("the manifest search stays inside the repository");
 
-    let old_lockfile = file_at_revision(&repository_root, &revision, lockfile_path)?;
+    let old_lockfile = file_at_revision(repository_root, revision, lockfile_path)?;
     let new_lockfile = fs::read_to_string(&project.lockfile).map_err(|source| Error::Io {
         context: format!("could not read {}", project.lockfile.display()),
         source,
     })?;
-    let old_manifest = file_at_revision(&repository_root, &revision, manifest_path)?;
+    let old_manifest = file_at_revision(repository_root, revision, manifest_path)?;
     let new_manifest = fs::read_to_string(&project.manifest).map_err(|source| Error::Io {
         context: format!("could not read {}", project.manifest.display()),
         source,
     })?;
 
-    let old_packages = options
-        .ecosystem
+    let old_packages = ecosystem
         .parse_lockfile(&old_lockfile)
         .map_err(|message| Error::File {
             label: format!("{revision}:{}", lockfile_path.display()),
             message,
         })?;
-    let new_packages = options
-        .ecosystem
+    let new_packages = ecosystem
         .parse_lockfile(&new_lockfile)
         .map_err(|message| Error::File {
             label: project.lockfile.display().to_string(),
             message,
         })?;
     let old_direct = direct_dependencies(
-        options.ecosystem,
-        &repository_root,
-        Some(&revision),
+        ecosystem,
+        repository_root,
+        Some(revision),
         manifest_path,
         &old_manifest,
     )?;
     let new_direct = direct_dependencies(
-        options.ecosystem,
-        &repository_root,
+        ecosystem,
+        repository_root,
         None,
         manifest_path,
         &new_manifest,
@@ -87,7 +136,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
         &direct,
         options.all,
         options.pretty,
-        options.ecosystem.package_label(),
+        ecosystem.package_label(),
     );
     Ok(())
 }
@@ -129,7 +178,7 @@ impl Ecosystem {
 }
 
 struct Options {
-    ecosystem: Ecosystem,
+    ecosystem: Option<Ecosystem>,
     revision: Option<String>,
     all: bool,
     pretty: bool,
@@ -155,9 +204,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
                 println!(
                     "Compare dependency lockfiles with another Git revision.\n\n\
                      Usage: cargo depdep [OPTIONS] [ECOSYSTEM]\n\n\
-                     Arguments:\n  [ECOSYSTEM]  Package ecosystem: rust or npm [default: rust]\n\n\
+                     Arguments:\n  [ECOSYSTEM]  Package ecosystem: rust or npm [default: auto-detect]\n\n\
                      Options:\n  \
-                       --rev <REV>  Git rev to compare against [default: main or repo default branch]\n  \
+                       --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]\n  \
                        --all  Include transitive dependency changes\n  \
                        --pretty  Align the columns for a nicely formatted ASCII table\n  \
                    -h, --help    Print help"
@@ -166,7 +215,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
             }
             Some("--pretty") => pretty = true,
             Some("--all") => all = true,
-            Some("rust" | "npm") => {
+            Some("rust" | "npm" | "js" | "ts" | "node") => {
                 if ecosystem.is_some() {
                     return Err(Error::Usage("expected at most one ecosystem".into()));
                 }
@@ -199,7 +248,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
     }
 
     Ok(Options {
-        ecosystem: ecosystem.unwrap_or(Ecosystem::Rust),
+        ecosystem,
         revision,
         all,
         pretty,
@@ -226,18 +275,23 @@ fn git_repository_root(current_dir: &Path) -> Result<PathBuf, Error> {
 }
 
 fn default_revision(repository_root: &Path) -> String {
-    // Prefer the branch the remote's HEAD points at, if it is configured.
+    // Prefer the remote-tracking branch so a stale local branch is not used.
     if let Some(reference) = git_line(
         repository_root,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     ) {
-        if let Some(branch) = reference.rsplit('/').next().filter(|name| !name.is_empty()) {
-            return branch.to_string();
+        if git_line(
+            repository_root,
+            &["rev-parse", "--verify", "--quiet", &reference],
+        )
+        .is_some()
+        {
+            return reference;
         }
     }
 
-    // Otherwise fall back to whichever conventional branch exists locally.
-    for candidate in ["main", "master"] {
+    // Remote HEAD may be unset; try conventional remote branches before local ones.
+    for candidate in ["origin/main", "origin/master", "main", "master"] {
         if git_line(
             repository_root,
             &["rev-parse", "--verify", "--quiet", candidate],
