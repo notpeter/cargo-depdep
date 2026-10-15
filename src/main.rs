@@ -1557,12 +1557,106 @@ fn separator(width: usize, right_aligned: bool) -> String {
 }
 
 fn versions(versions: Option<&BTreeSet<String>>) -> String {
-    versions
+    let mut versions = versions
         .into_iter()
         .flatten()
+        .map(|version| (version, SemanticVersion::parse(version)))
+        .collect::<Vec<_>>();
+    versions.sort_by(|(left, left_semver), (right, right_semver)| {
+        match (left_semver, right_semver) {
+            (Some(left), Some(right)) => left.cmp(right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| left.cmp(right))
+    });
+    versions
+        .into_iter()
+        .map(|(version, _)| version)
         .map(|version| escape_markdown(version))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+struct SemanticVersion<'a> {
+    core: [&'a str; 3],
+    prerelease: Option<&'a str>,
+}
+
+impl<'a> SemanticVersion<'a> {
+    fn parse(version: &'a str) -> Option<Self> {
+        let (version, build) = version
+            .split_once('+')
+            .map_or((version, None), |(version, build)| (version, Some(build)));
+        if build.is_some_and(|build| !valid_identifiers(build, false)) {
+            return None;
+        }
+        let (core, prerelease) = version
+            .split_once('-')
+            .map_or((version, None), |(core, pre)| (core, Some(pre)));
+        if prerelease.is_some_and(|pre| !valid_identifiers(pre, true)) {
+            return None;
+        }
+        let core: [&str; 3] = core.split('.').collect::<Vec<_>>().try_into().ok()?;
+        if !core.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        }) {
+            return None;
+        }
+        Some(Self { core, prerelease })
+    }
+
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        for (left, right) in self.core.iter().zip(other.core) {
+            let order = left.len().cmp(&right.len()).then_with(|| left.cmp(&right));
+            if order != Ordering::Equal {
+                return order;
+            }
+        }
+        let (left, right) = match (self.prerelease, other.prerelease) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Greater,
+            (Some(_), None) => return Ordering::Less,
+            (Some(left), Some(right)) => (left, right),
+        };
+        let mut left = left.split('.');
+        let mut right = right.split('.');
+        loop {
+            let (left, right) = match (left.next(), right.next()) {
+                (None, None) => return Ordering::Equal,
+                (None, Some(_)) => return Ordering::Less,
+                (Some(_), None) => return Ordering::Greater,
+                (Some(left), Some(right)) => (left, right),
+            };
+            let numeric = |value: &str| value.bytes().all(|byte| byte.is_ascii_digit());
+            let order = match (numeric(left), numeric(right)) {
+                (true, true) => left.len().cmp(&right.len()).then_with(|| left.cmp(right)),
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => left.cmp(right),
+            };
+            if order != Ordering::Equal {
+                return order;
+            }
+        }
+    }
+}
+
+fn valid_identifiers(value: &str, prerelease: bool) -> bool {
+    value.split('.').all(|part| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !(prerelease
+                && part.len() > 1
+                && part.starts_with('0')
+                && part.bytes().all(|byte| byte.is_ascii_digit()))
+    })
 }
 
 fn escape_markdown(value: &str) -> String {
@@ -1766,6 +1860,51 @@ version = "1.0.0"
         .unwrap();
 
         assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn sorts_versions_by_semantic_precedence() {
+        for expected in [
+            "7.2.0, 8.3.0, 11.1.0",
+            "7.2.0, 11.1.0, 15.0.0",
+            "1.2.9, 1.2.10, 1.9.0, 1.10.0",
+            "1.0.0-alpha, 1.0.0-alpha.1, 1.0.0-alpha.beta, 1.0.0-beta, 1.0.0-beta.2, 1.0.0-beta.11, 1.0.0-rc.1, 1.0.0",
+            "1.0.0-rc.1+build, 1.0.0+aaa, 1.0.0+zzz, 2.0.0",
+            "1.0.0, file:local, git+https://example.com/package",
+        ] {
+            let input = expected.split(", ").map(String::from).collect();
+            assert_eq!(versions(Some(&input)), expected);
+        }
+        assert_eq!(versions(None), "");
+        assert_eq!(versions(Some(&BTreeSet::new())), "");
+    }
+
+    #[test]
+    fn validates_semantic_versions() {
+        for invalid in [
+            "",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.3-",
+            "1.2.3-01",
+            "1.2.3-alpha..1",
+            "1.2.3+",
+            "1.2.3+a+b",
+            "1.2.3-alpha_1",
+        ] {
+            assert!(SemanticVersion::parse(invalid).is_none(), "{invalid}");
+        }
+        assert!(SemanticVersion::parse("1.2.3-alpha.0+001").is_some());
+        assert_eq!(
+            SemanticVersion::parse("1.2.3+aaa")
+                .unwrap()
+                .cmp(&SemanticVersion::parse("1.2.3+zzz").unwrap()),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
