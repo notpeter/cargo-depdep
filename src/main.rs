@@ -91,36 +91,42 @@ fn compare_project(
         .strip_prefix(repository_root)
         .expect("the manifest search stays inside the repository");
 
-    let old_lockfile = file_at_revision(repository_root, revision, lockfile_path)?;
+    let old_lockfile = optional_file_at_revision(repository_root, revision, lockfile_path)?;
     let new_lockfile = fs::read_to_string(&project.lockfile).map_err(|source| Error::Io {
         context: format!("could not read {}", project.lockfile.display()),
         source,
     })?;
-    let old_manifest = file_at_revision(repository_root, revision, manifest_path)?;
+    let old_manifest = optional_file_at_revision(repository_root, revision, manifest_path)?;
     let new_manifest = fs::read_to_string(&project.manifest).map_err(|source| Error::Io {
         context: format!("could not read {}", project.manifest.display()),
         source,
     })?;
 
-    let old_packages = ecosystem
-        .parse_lockfile(&old_lockfile)
+    let old_packages = old_lockfile
+        .as_deref()
+        .map(|contents| ecosystem.parse_lockfile(contents))
+        .transpose()
         .map_err(|message| Error::File {
             label: format!("{revision}:{}", lockfile_path.display()),
             message,
-        })?;
+        })?
+        .unwrap_or_default();
     let new_packages = ecosystem
         .parse_lockfile(&new_lockfile)
         .map_err(|message| Error::File {
             label: project.lockfile.display().to_string(),
             message,
         })?;
-    let old_direct = direct_dependencies(
-        ecosystem,
-        repository_root,
-        Some(revision),
-        manifest_path,
-        &old_manifest,
-    )?;
+    let old_direct = match old_manifest {
+        Some(contents) => direct_dependencies(
+            ecosystem,
+            repository_root,
+            Some(revision),
+            manifest_path,
+            &contents,
+        )?,
+        None => BTreeSet::new(),
+    };
     let new_direct = direct_dependencies(
         ecosystem,
         repository_root,
@@ -387,6 +393,36 @@ fn file_at_revision(
     }
 
     String::from_utf8(output.stdout).map_err(|_| Error::Git(format!("{object} is not valid UTF-8")))
+}
+
+fn optional_file_at_revision(
+    repository_root: &Path,
+    revision: &str,
+    path: &Path,
+) -> Result<Option<String>, Error> {
+    match file_at_revision(repository_root, revision, path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) => {
+            // Only an absent path in a valid tree means an empty baseline.
+            // Preserve errors for invalid revisions and unreadable objects.
+            let output = Command::new("git")
+                .args([
+                    "--literal-pathspecs",
+                    "ls-tree",
+                    "--full-tree",
+                    "-z",
+                    revision,
+                    "--",
+                ])
+                .arg(path)
+                .current_dir(repository_root)
+                .output();
+            match output {
+                Ok(output) if output.status.success() && output.stdout.is_empty() => Ok(None),
+                _ => Err(error),
+            }
+        }
+    }
 }
 
 fn command_error(stderr: &[u8]) -> String {
