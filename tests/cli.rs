@@ -180,7 +180,7 @@ fn detects_ecosystems_and_allows_explicit_overrides() {
     assert!(
         String::from_utf8(neither.stderr)
             .unwrap()
-            .contains("could not find Cargo.toml or package.json")
+            .contains("could not find Cargo.toml or package.json or Gemfile")
     );
     fs::remove_dir_all(repository).unwrap();
 }
@@ -191,7 +191,7 @@ fn missing_base_files_show_added_dependencies() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    for ecosystem in ["rust", "npm"] {
+    for ecosystem in ["rust", "npm", "ruby"] {
         for baseline in ["neither", "manifest", "lockfile"] {
             let repository = std::env::temp_dir().join(format!(
                 "cargo-depdep-added-{}-{nonce}-{ecosystem}-{baseline}",
@@ -210,7 +210,7 @@ fn missing_base_files_show_added_dependencies() {
                     lockfile(&[("added", "1.0.0"), ("transitive", "2.0.0")]),
                     "crate",
                 )
-            } else {
+            } else if ecosystem == "npm" {
                 (
                         "package.json",
                         r#"{"dependencies":{"added":"*"}}"#.into(),
@@ -218,6 +218,14 @@ fn missing_base_files_show_added_dependencies() {
                         r#"{"lockfileVersion":3,"packages":{"node_modules/added":{"version":"1.0.0"},"node_modules/transitive":{"version":"2.0.0"}}}"#.into(),
                         "package",
                     )
+            } else {
+                (
+                    "Gemfile",
+                    "gem 'added'\n".into(),
+                    "Gemfile.lock",
+                    gem_lockfile(&[("added", "1.0.0"), ("transitive", "2.0.0")], &["added"]),
+                    "gem",
+                )
             };
             if baseline == "manifest" {
                 fs::write(project.join(manifest_name), &manifest_text).unwrap();
@@ -290,6 +298,90 @@ fn missing_base_files_show_added_dependencies() {
     }
 }
 
+#[test]
+fn compares_ruby_direct_and_transitive_changes_from_nested_directories() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let repository =
+        std::env::temp_dir().join(format!("cargo-depdep-ruby-{}-{nonce}", std::process::id()));
+    let nested = repository.join("lib/nested");
+    fs::create_dir_all(&nested).unwrap();
+    git(&repository, &["init", "--quiet"]);
+    // Direct dependencies must come from the lockfile without executing Ruby.
+    fs::write(repository.join("Gemfile"), "raise 'do not execute'\n").unwrap();
+    fs::write(
+        repository.join("Gemfile.lock"),
+        gem_lockfile(
+            &[
+                ("removed", "1.0"),
+                ("rouge", "4.6.1"),
+                ("transitive", "1.0"),
+            ],
+            &["removed", "rouge"],
+        ),
+    )
+    .unwrap();
+    git(&repository, &["add", "."]);
+    let revision = tree(&repository);
+    fs::write(
+        repository.join("Gemfile.lock"),
+        gem_lockfile(
+            &[("added", "0.1"), ("rouge", "5.0.0"), ("transitive", "2.0")],
+            &["added", "rouge"],
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cargo-depdep"))
+            .args(["--rev", &revision])
+            .args(args)
+            .current_dir(&nested)
+            .output()
+            .unwrap()
+    };
+    let expected = "| gem | old | new |\n| --- | --- | --- |\n| added |  | 0.1 |\n| removed | 1.0 |  |\n| rouge | 4.6.1 | 5.0.0 |\n";
+    for args in [&[][..], &["ruby"], &["gem"], &["gems"]] {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("1 additional transitive"));
+    }
+    let all = run(&["ruby", "--all"]);
+    assert!(all.status.success());
+    assert_eq!(
+        String::from_utf8(all.stdout).unwrap(),
+        format!("{expected}| transitive | 1.0 | 2.0 |\n")
+    );
+    assert!(all.stderr.is_empty());
+    let pretty = run(&["ruby", "--pretty"]);
+    assert!(pretty.status.success());
+    assert!(String::from_utf8_lossy(&pretty.stdout).contains("| rouge   | 4.6.1 | 5.0.0 |"));
+
+    fs::write(repository.join("package.json"), "{}").unwrap();
+    fs::write(
+        repository.join("package-lock.json"),
+        "{\"lockfileVersion\":3,\"packages\":{}}",
+    )
+    .unwrap();
+    let multiple = run(&[]);
+    assert!(multiple.status.success());
+    assert_eq!(
+        String::from_utf8(multiple.stdout).unwrap(),
+        format!("## npm\n\n\n## Ruby\n\n{expected}")
+    );
+    fs::remove_file(repository.join("Gemfile.lock")).unwrap();
+    let missing = run(&["ruby"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("Gemfile and Gemfile.lock"));
+    fs::remove_dir_all(repository).unwrap();
+}
+
 fn tree(repository: &Path) -> String {
     let output = Command::new("git")
         .arg("write-tree")
@@ -330,5 +422,18 @@ fn manifest(dependencies: &[&str]) -> String {
     for dependency in dependencies {
         contents.push_str(&format!("{dependency} = \"*\"\n"));
     }
+    contents
+}
+
+fn gem_lockfile(packages: &[(&str, &str)], direct: &[&str]) -> String {
+    let mut contents = String::from("GEM\n  remote: https://rubygems.org/\n  specs:\n");
+    for (name, version) in packages {
+        contents.push_str(&format!("    {name} ({version})\n"));
+    }
+    contents.push_str("\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n");
+    for name in direct {
+        contents.push_str(&format!("  {name}\n"));
+    }
+    contents.push_str("\nBUNDLED WITH\n   4.0.11\n");
     contents
 }

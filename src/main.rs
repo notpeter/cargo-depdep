@@ -11,6 +11,8 @@ const CARGO_MANIFEST: &str = "Cargo.toml";
 const CARGO_LOCKFILE: &str = "Cargo.lock";
 const NPM_MANIFEST: &str = "package.json";
 const NPM_LOCKFILE: &str = "package-lock.json";
+const RUBY_MANIFEST: &str = "Gemfile";
+const RUBY_LOCKFILE: &str = "Gemfile.lock";
 
 fn main() {
     if let Err(error) = run(env::args_os().skip(1)) {
@@ -35,6 +37,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
         None => [
             (Ecosystem::Rust, CARGO_MANIFEST),
             (Ecosystem::Npm, NPM_MANIFEST),
+            (Ecosystem::Ruby, RUBY_MANIFEST),
         ]
         .into_iter()
         .filter(|(_, manifest)| find_file(&current_dir, &repository_root, manifest).is_some())
@@ -43,7 +46,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
     };
     if ecosystems.is_empty() {
         return Err(Error::Usage(format!(
-            "could not find Cargo.toml or package.json between {} and {}",
+            "could not find Cargo.toml or package.json or Gemfile between {} and {}",
             current_dir.display(),
             repository_root.display()
         )));
@@ -59,6 +62,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
                 match ecosystem {
                     Ecosystem::Rust => "Rust",
                     Ecosystem::Npm => "npm",
+                    Ecosystem::Ruby => "Ruby",
                 }
             );
             println!();
@@ -102,7 +106,7 @@ fn compare_project(
         source,
     })?;
 
-    let old_packages = old_lockfile
+    let (old_packages, old_locked_direct) = old_lockfile
         .as_deref()
         .map(|contents| ecosystem.parse_lockfile(contents))
         .transpose()
@@ -111,29 +115,37 @@ fn compare_project(
             message,
         })?
         .unwrap_or_default();
-    let new_packages = ecosystem
-        .parse_lockfile(&new_lockfile)
-        .map_err(|message| Error::File {
-            label: project.lockfile.display().to_string(),
-            message,
-        })?;
-    let old_direct = match old_manifest {
-        Some(contents) => direct_dependencies(
+    let (new_packages, new_locked_direct) =
+        ecosystem
+            .parse_lockfile(&new_lockfile)
+            .map_err(|message| Error::File {
+                label: project.lockfile.display().to_string(),
+                message,
+            })?;
+    let (old_direct, new_direct) = if matches!(ecosystem, Ecosystem::Ruby) {
+        // Gemfiles are executable Ruby. Bundler already records their direct
+        // dependencies in the lockfile, including groups and non-default sources.
+        (old_locked_direct, new_locked_direct)
+    } else {
+        let old_direct = match old_manifest {
+            Some(contents) => direct_dependencies(
+                ecosystem,
+                repository_root,
+                Some(revision),
+                manifest_path,
+                &contents,
+            )?,
+            None => BTreeSet::new(),
+        };
+        let new_direct = direct_dependencies(
             ecosystem,
             repository_root,
-            Some(revision),
+            None,
             manifest_path,
-            &contents,
-        )?,
-        None => BTreeSet::new(),
+            &new_manifest,
+        )?;
+        (old_direct, new_direct)
     };
-    let new_direct = direct_dependencies(
-        ecosystem,
-        repository_root,
-        None,
-        manifest_path,
-        &new_manifest,
-    )?;
     let direct = old_direct.union(&new_direct).cloned().collect();
 
     print_diff(
@@ -151,20 +163,17 @@ fn compare_project(
 enum Ecosystem {
     Rust,
     Npm,
+    Ruby,
 }
 
 impl Ecosystem {
-    fn parse_lockfile(self, contents: &str) -> Result<Packages, String> {
+    fn parse_lockfile(self, contents: &str) -> Result<(Packages, BTreeSet<String>), String> {
         match self {
-            Self::Rust => parse_cargo_lockfile(contents),
-            Self::Npm => parse_npm_lockfile(contents),
-        }
-    }
-
-    fn parse_manifest(self, contents: &str) -> Result<BTreeSet<String>, String> {
-        match self {
-            Self::Rust => parse_cargo_manifest(contents),
-            Self::Npm => parse_npm_manifest(contents),
+            Self::Rust => {
+                parse_cargo_lockfile(contents).map(|packages| (packages, BTreeSet::new()))
+            }
+            Self::Npm => parse_npm_lockfile(contents).map(|packages| (packages, BTreeSet::new())),
+            Self::Ruby => parse_gem_lockfile(contents),
         }
     }
 
@@ -172,6 +181,7 @@ impl Ecosystem {
         match self {
             Self::Rust => "crate",
             Self::Npm => "package",
+            Self::Ruby => "gem",
         }
     }
 
@@ -179,6 +189,7 @@ impl Ecosystem {
         match self {
             Self::Rust => "Cargo.toml and Cargo.lock",
             Self::Npm => "package.json and package-lock.json",
+            Self::Ruby => "Gemfile and Gemfile.lock",
         }
     }
 }
@@ -210,7 +221,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
                 println!(
                     "Compare dependency lockfiles with another Git revision.\n\n\
                      Usage: cargo depdep [OPTIONS] [ECOSYSTEM]\n\n\
-                     Arguments:\n  [ECOSYSTEM]  Package ecosystem: rust or npm [default: auto-detect]\n\n\
+                     Arguments:\n  [ECOSYSTEM]  Package ecosystem: rust, npm, or ruby [default: auto-detect]\n\n\
                      Options:\n  \
                        --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]\n  \
                        --all  Include transitive dependency changes\n  \
@@ -221,14 +232,14 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
             }
             Some("--pretty") => pretty = true,
             Some("--all") => all = true,
-            Some("rust" | "npm" | "js" | "ts" | "node") => {
+            Some("rust" | "npm" | "js" | "ts" | "node" | "ruby" | "gem" | "gems") => {
                 if ecosystem.is_some() {
                     return Err(Error::Usage("expected at most one ecosystem".into()));
                 }
-                ecosystem = Some(if arg == "rust" {
-                    Ecosystem::Rust
-                } else {
-                    Ecosystem::Npm
+                ecosystem = Some(match arg.to_str().unwrap() {
+                    "rust" => Ecosystem::Rust,
+                    "ruby" | "gem" | "gems" => Ecosystem::Ruby,
+                    _ => Ecosystem::Npm,
                 });
             }
             Some("--rev" | "--branch") => {
@@ -338,6 +349,7 @@ fn find_project(
     let (manifest_name, lockfile_name) = match ecosystem {
         Ecosystem::Rust => (CARGO_MANIFEST, CARGO_LOCKFILE),
         Ecosystem::Npm => (NPM_MANIFEST, NPM_LOCKFILE),
+        Ecosystem::Ruby => (RUBY_MANIFEST, RUBY_LOCKFILE),
     };
     let manifest = find_file(current_dir, repository_root, manifest_name);
     let lockfile = find_file(current_dir, repository_root, lockfile_name);
@@ -436,6 +448,75 @@ fn command_error(stderr: &[u8]) -> String {
 }
 
 type Packages = BTreeMap<String, BTreeSet<String>>;
+
+// Read only resolved specs and top-level declarations, not nested requirements,
+// checksums, platform lists, or the Bundler/Ruby versions.
+fn parse_gem_lockfile(contents: &str) -> Result<(Packages, BTreeSet<String>), String> {
+    let mut packages = Packages::new();
+    let mut direct = BTreeSet::new();
+    let mut section = "";
+    let mut in_specs = false;
+    let mut saw_dependencies = false;
+
+    for (index, line) in contents.lines().enumerate() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            section = line;
+            in_specs = false;
+            saw_dependencies |= section == "DEPENDENCIES";
+            continue;
+        }
+        if matches!(section, "GEM" | "GIT" | "PATH") {
+            if line == "  specs:" {
+                in_specs = true;
+            } else if line.starts_with("  ") && !line.starts_with("    ") {
+                in_specs = false;
+            } else if in_specs && line.starts_with("    ") && !line.starts_with("     ") {
+                let entry = line.trim();
+                let (name, version) = entry
+                    .split_once(" (")
+                    .and_then(|(name, rest)| rest.strip_suffix(')').map(|v| (name, v)))
+                    .filter(|(name, version)| {
+                        valid_gem_name(name)
+                            && !version.is_empty()
+                            && !version.chars().any(char::is_whitespace)
+                    })
+                    .ok_or_else(|| {
+                        format!("line {}: expected a gem name and version", index + 1)
+                    })?;
+                packages
+                    .entry(name.into())
+                    .or_default()
+                    .insert(version.into());
+            }
+        } else if section == "DEPENDENCIES" {
+            let entry = line.trim();
+            let name = entry
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .trim_end_matches('!');
+            if !valid_gem_name(name) {
+                return Err(format!("line {}: invalid gem dependency", index + 1));
+            }
+            direct.insert(name.into());
+        }
+    }
+    if !saw_dependencies {
+        return Err("missing DEPENDENCIES section".into());
+    }
+    Ok((packages, direct))
+}
+
+fn valid_gem_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
 
 fn parse_cargo_lockfile(contents: &str) -> Result<Packages, String> {
     let mut packages = Packages::new();
@@ -856,7 +937,7 @@ fn direct_dependencies(
         message,
     };
     if matches!(ecosystem, Ecosystem::Npm) {
-        return ecosystem.parse_manifest(contents).map_err(error);
+        return parse_npm_manifest(contents).map_err(error);
     }
     let source = ManifestSource { root, revision };
     let workspace = parse_workspace(contents).map_err(&error)?;
@@ -1692,6 +1773,81 @@ impl fmt::Display for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_bundler_sources_platforms_and_direct_dependencies() {
+        let (packages, direct) = parse_gem_lockfile(
+            r#"GIT
+  remote: https://example.com/repo.git
+  revision: abc123
+  specs:
+    git-gem (1.2.3)
+      rack (~> 3.0)
+
+PATH
+  remote: .
+  specs:
+    local_gem (0.1.0)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    Ascii85 (2.0.1)
+    rack (3.1.0)
+    nokogiri (1.18.0)
+    nokogiri (1.18.0-arm64-darwin)
+    nokogiri (1.18.0-x86_64-linux-gnu)
+    prerelease (1.0.0.rc1)
+
+PLATFORMS
+  ruby
+  arm64-darwin
+
+DEPENDENCIES
+  git-gem!
+  local_gem (>= 0)!
+  nokogiri (~> 1.18)
+
+CHECKSUMS
+  rack (3.1.0) sha256=abc
+
+RUBY VERSION
+   ruby 3.4.0p0
+
+BUNDLED WITH
+   4.0.11
+"#,
+        )
+        .unwrap();
+        assert_eq!(packages.len(), 6);
+        assert_eq!(packages["git-gem"], BTreeSet::from(["1.2.3".into()]));
+        assert_eq!(packages["Ascii85"], BTreeSet::from(["2.0.1".into()]));
+        assert_eq!(packages["prerelease"], BTreeSet::from(["1.0.0.rc1".into()]));
+        assert_eq!(
+            packages["nokogiri"],
+            BTreeSet::from([
+                "1.18.0".into(),
+                "1.18.0-arm64-darwin".into(),
+                "1.18.0-x86_64-linux-gnu".into(),
+            ])
+        );
+        assert_eq!(
+            direct,
+            BTreeSet::from(["git-gem".into(), "local_gem".into(), "nokogiri".into()])
+        );
+        assert_eq!(
+            parse_gem_lockfile("GEM\n  specs:\n\nDEPENDENCIES\n").unwrap(),
+            (Packages::new(), BTreeSet::new())
+        );
+        for malformed in [
+            "not a lockfile",
+            "GEM\n  specs:\n    broken\n\nDEPENDENCIES\n",
+            "GEM\n  specs:\n    broken ()\n\nDEPENDENCIES\n",
+            "DEPENDENCIES\n  !\n",
+        ] {
+            assert!(parse_gem_lockfile(malformed).is_err(), "{malformed}");
+        }
+    }
 
     #[test]
     fn workspace_dependencies_follow_members_on_each_side() {

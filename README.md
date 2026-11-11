@@ -1,7 +1,7 @@
 # cargo-depdep
 
 `cargo-depdep` compares the dependency lockfile in your working tree with the
-lockfile at another Git revision. It supports Rust and npm projects, groups
+lockfile at another Git revision. It supports Rust, npm, and Ruby projects, groups
 every resolved version by package name, and prints the changes as a Markdown
 table.
 
@@ -21,7 +21,7 @@ Compare dependency lockfiles with another Git revision.
 Usage: cargo depdep [OPTIONS] [ECOSYSTEM]
 
 Arguments:
-  [ECOSYSTEM]  Package ecosystem: rust or npm [default: auto-detect]
+  [ECOSYSTEM]  Package ecosystem: rust, npm, or ruby [default: auto-detect]
 
 Options:
   --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]
@@ -37,10 +37,11 @@ then `origin/main` or `origin/master`, then local `main` or `master`.
 Remote-tracking branches reflect the last fetch; run `git fetch origin` to update
 them without pulling. Use `--rev <REV>` to choose a revision explicitly.
 
-`cargo depdep` detects `Cargo.toml` and `package.json` from the current directory
-up to the repository root. If both are found, it compares both ecosystems in
-separate Rust and npm sections. Each detected ecosystem requires its lockfile.
-Pass `rust` or `npm` to compare only that ecosystem.
+`cargo depdep` detects `Cargo.toml`, `package.json`, and `Gemfile` from the
+current directory up to the repository root. If multiple are found, it compares each ecosystem in
+separate Rust, npm, and Ruby sections. Each detected ecosystem requires its lockfile.
+Pass `rust`, `npm`, or `ruby` to compare only that ecosystem.
+Ruby also accepts `gem` and `gems` as aliases.
 
 For a Rust project:
 
@@ -62,8 +63,19 @@ For an npm project, detection works automatically; you can also pass `npm`:
 | typescript | 5.8.3 | 5.9.2 |
 ```
 
+For a Ruby project using Bundler:
+
+```console
+# cargo depdep ruby
+| gem | old | new |
+| --- | --- | --- |
+| asciidoctor | 2.0.23 | 2.0.26 |
+| rouge | 4.6.1 | 5.0.0 |
+```
+
 By default, the table only includes direct dependencies declared in
-`Cargo.toml` or `package.json`. If other resolved packages changed, the command
+`Cargo.toml` or `package.json`, or recorded in `Gemfile.lock` under
+`DEPENDENCIES`. If other resolved packages changed, the command
 prints a hint to stderr:
 
 ```console
@@ -89,15 +101,20 @@ Example output:
 
 The command searches from the current directory toward the repository root. A
 Rust project is identified by `Cargo.toml` and `Cargo.lock`; an npm project uses
-`package.json` and `package-lock.json`. The `old` column comes from the selected
+`package.json` and `package-lock.json`; a Ruby project uses `Gemfile` and
+`Gemfile.lock`. The `old` column comes from the selected
 revision and the `new` column comes from the working tree. Added and removed
-packages have an empty cell. Direct dependencies are taken from both versions
-of the manifest so that additions and removals are included. At a Rust workspace
+packages have an empty cell. Direct dependencies are taken from both revisions
+so that additions and removals are included. At a Rust workspace
 root, direct dependencies are collected from its member manifests on each side
 of the comparison, including workspace-inherited dependencies. Member patterns
 and exclusions are respected; unused workspace dependency declarations are not
 counted as direct dependencies. Resolved npm
-versions come from `package-lock.json`.
+versions come from `package-lock.json`. Ruby versions and direct dependencies
+come from `Gemfile.lock`, without executing the Gemfile or requiring Ruby or
+Bundler to be installed. Gems from registry, Git, and path sources are included,
+as are platform-specific versions. Changes to source URLs or Git revisions alone
+are not reported when gem versions stay the same.
 
 No deps!
 
