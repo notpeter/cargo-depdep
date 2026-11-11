@@ -51,6 +51,20 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
             repository_root.display()
         )));
     }
+    if options.security {
+        for ecosystem in &ecosystems {
+            if !matches!(ecosystem, Ecosystem::Npm) {
+                return Err(Error::Usage(format!(
+                    "--security is not implemented for {}",
+                    match ecosystem {
+                        Ecosystem::Rust => "Rust",
+                        Ecosystem::Ruby => "Ruby",
+                        Ecosystem::Npm => unreachable!(),
+                    }
+                )));
+            }
+        }
+    }
     let multiple = ecosystems.len() > 1;
     for (index, ecosystem) in ecosystems.into_iter().enumerate() {
         if multiple {
@@ -127,13 +141,13 @@ fn compare_project(
         // dependencies in the lockfile, including groups and non-default sources.
         (old_locked_direct, new_locked_direct)
     } else {
-        let old_direct = match old_manifest {
+        let old_direct = match &old_manifest {
             Some(contents) => direct_dependencies(
                 ecosystem,
                 repository_root,
                 Some(revision),
                 manifest_path,
-                &contents,
+                contents,
             )?,
             None => BTreeSet::new(),
         };
@@ -147,6 +161,27 @@ fn compare_project(
         (old_direct, new_direct)
     };
     let direct = old_direct.union(&new_direct).cloned().collect();
+
+    if options.security && old_packages != new_packages && !old_packages.is_empty() {
+        let fixes = std::thread::scope(|scope| {
+            let old_audit = scope.spawn(|| {
+                npm_audit(
+                    old_manifest.as_deref().unwrap_or("{}"),
+                    old_lockfile
+                        .as_deref()
+                        .expect("old packages require a lockfile"),
+                )
+            });
+            let new_advisories = npm_audit(&new_manifest, &new_lockfile);
+            let old_advisories = old_audit
+                .join()
+                .map_err(|_| Error::Usage("npm audit worker panicked".into()))?;
+            Ok::<_, Error>(security_fixes(&old_advisories?, &new_advisories?))
+        })?;
+        if !fixes.is_empty() {
+            println!("{fixes}");
+        }
+    }
 
     print_diff(
         &old_packages,
@@ -199,6 +234,7 @@ struct Options {
     revision: Option<String>,
     all: bool,
     pretty: bool,
+    security: bool,
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error> {
@@ -214,6 +250,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
     let mut pretty = false;
     let mut all = false;
     let mut ecosystem = None;
+    let mut security = false;
 
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -225,6 +262,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
                      Options:\n  \
                        --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]\n  \
                        --all  Include transitive dependency changes\n  \
+                       --security  List fixed npm security advisories before the table\n  \
                        --pretty  Align the columns for a nicely formatted ASCII table\n  \
                    -h, --help    Print help"
                 );
@@ -232,6 +270,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
             }
             Some("--pretty") => pretty = true,
             Some("--all") => all = true,
+            Some("--security") => security = true,
             Some("rust" | "npm" | "js" | "ts" | "node" | "ruby" | "gem" | "gems") => {
                 if ecosystem.is_some() {
                     return Err(Error::Usage("expected at most one ecosystem".into()));
@@ -269,6 +308,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
         revision,
         all,
         pretty,
+        security,
     })
 }
 
@@ -1169,6 +1209,134 @@ fn inline_toml_field<'a>(
     Ok(None)
 }
 
+// Audit isolated snapshots so neither node_modules nor the working tree can
+// affect the comparison. npm audit does not install packages or execute scripts.
+struct AuditDirectory(PathBuf);
+
+impl Drop for AuditDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn npm_audit(manifest: &str, lockfile: &str) -> Result<Packages, Error> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the Unix epoch")
+        .as_nanos();
+    let path = env::temp_dir().join(format!("cargo-depdep-audit-{}-{nonce}", process::id()));
+    fs::create_dir(&path).map_err(|source| Error::Io {
+        context: "could not create npm audit directory".into(),
+        source,
+    })?;
+    let directory = AuditDirectory(path);
+    for (name, contents) in [(NPM_MANIFEST, manifest), (NPM_LOCKFILE, lockfile)] {
+        fs::write(directory.0.join(name), contents).map_err(|source| Error::Io {
+            context: format!("could not write npm audit snapshot {name}"),
+            source,
+        })?;
+    }
+    let output = Command::new("npm")
+        .args([
+            "audit",
+            "--json",
+            "--package-lock-only",
+            "--ignore-scripts",
+            "--include=dev",
+            "--include=optional",
+            "--include=peer",
+            "--fetch-retries=0",
+            "--fetch-timeout=30000",
+            "--cache",
+        ])
+        // Keep npm's metadata cache across snapshots and invocations. Audit
+        // reports themselves still come from the registry on every run.
+        .arg(env::temp_dir().join("cargo-depdep-npm-cache"))
+        .current_dir(&directory.0)
+        .output()
+        .map_err(|source| Error::Io {
+            context: "could not run npm audit (npm 7 or newer is required)".into(),
+            source,
+        })?;
+    // npm exits with 1 for a successful audit that found vulnerabilities.
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(Error::Usage(format!(
+            "npm audit failed: {}",
+            command_error(&output.stderr)
+        )));
+    }
+    let report = String::from_utf8(output.stdout)
+        .map_err(|_| Error::Usage("npm audit returned non-UTF-8 output".into()))?;
+    parse_npm_audit(&report).map_err(|message| Error::Usage(format!("npm audit failed: {message}")))
+}
+
+fn parse_npm_audit(contents: &str) -> Result<Packages, String> {
+    let json = parse_json(contents)?;
+    let root = json.as_object().ok_or("expected an audit report object")?;
+    if let Some(error) = root.get("error") {
+        let message = error
+            .as_object()
+            .map(|object| json_string_field(object, "summary"))
+            .transpose()?
+            .flatten()
+            .unwrap_or("registry returned an error");
+        return Err(message.into());
+    }
+    let vulnerabilities = root
+        .get("vulnerabilities")
+        .and_then(JsonValue::as_object)
+        .ok_or("missing vulnerabilities object (npm 7 or newer is required)")?;
+    let mut advisories = Packages::new();
+    for vulnerability in vulnerabilities.values() {
+        let record = vulnerability
+            .as_object()
+            .ok_or("expected a vulnerability object")?;
+        let Some(JsonValue::Array(via)) = record.get("via") else {
+            return Err("expected a vulnerability via array".into());
+        };
+        for entry in via {
+            // Strings describe meta-vulnerabilities in dependents, not advisories.
+            let Some(advisory) = entry.as_object() else {
+                continue;
+            };
+            let name =
+                json_string_field(advisory, "name")?.ok_or("missing advisory package name")?;
+            let url = json_string_field(advisory, "url")?.ok_or("missing advisory URL")?;
+            let Some(id) = url.strip_prefix("https://github.com/advisories/") else {
+                continue;
+            };
+            if id.starts_with("GHSA-")
+                && id.len() == 19
+                && id[5..].split('-').count() == 3
+                && id[5..].split('-').all(|part| {
+                    part.len() == 4
+                        && part
+                            .bytes()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                })
+            {
+                advisories.entry(name.into()).or_default().insert(id.into());
+            }
+        }
+    }
+    Ok(advisories)
+}
+
+fn security_fixes(old: &Packages, new: &Packages) -> String {
+    let mut output = String::new();
+    for (name, advisories) in old {
+        let fixed: Vec<_> = advisories
+            .iter()
+            .filter(|id| !new.get(name).is_some_and(|current| current.contains(*id)))
+            .cloned()
+            .collect();
+        if !fixed.is_empty() {
+            output.push_str(&format!("- Fixes {} ({name})\n", fixed.join(", ")));
+        }
+    }
+    output
+}
+
 fn parse_npm_manifest(contents: &str) -> Result<BTreeSet<String>, String> {
     let json = parse_json(contents)?;
     let root = json
@@ -1286,6 +1454,7 @@ fn json_string_field<'a>(
 enum JsonValue {
     Object(BTreeMap<String, JsonValue>),
     String(String),
+    Array(Vec<JsonValue>),
     Other,
 }
 
@@ -1357,12 +1526,13 @@ impl JsonParser<'_> {
     fn parse_array(&mut self) -> Result<JsonValue, String> {
         self.expect(b'[')?;
         self.skip_whitespace();
+        let mut values = Vec::new();
         if self.consume(b']') {
-            return Ok(JsonValue::Other);
+            return Ok(JsonValue::Array(values));
         }
 
         loop {
-            self.parse_value()?;
+            values.push(self.parse_value()?);
             self.skip_whitespace();
             if self.consume(b']') {
                 break;
@@ -1370,7 +1540,7 @@ impl JsonParser<'_> {
             self.expect(b',')?;
         }
 
-        Ok(JsonValue::Other)
+        Ok(JsonValue::Array(values))
     }
 
     fn parse_string(&mut self) -> Result<String, String> {
@@ -1773,6 +1943,41 @@ impl fmt::Display for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_only_fully_resolved_advisories_grouped_by_package() {
+        let old = parse_npm_audit(
+            r#"{"vulnerabilities": {
+            "dependent": {"via": ["qs"]},
+            "qs": {"via": [
+                {"name":"qs","url":"https://github.com/advisories/GHSA-6pq8-jhm2-2vcw"},
+                {"name":"qs","url":"https://github.com/advisories/GHSA-6pq8-jhm2-2vcw"},
+                {"name":"qs","url":"https://github.com/advisories/GHSA-w74x-v6f9-j3xg"}
+            ]},
+            "@vitest/mocker": {"via": [
+                {"name":"@vitest/mocker","url":"https://github.com/advisories/GHSA-xp26-3454-mjgp"}
+            ]}
+        }}"#,
+        )
+        .unwrap();
+        let new = parse_npm_audit(
+            r#"{"vulnerabilities": {
+            "qs": {"via": [
+                {"name":"qs","url":"https://github.com/advisories/GHSA-w74x-v6f9-j3xg"}
+            ]}
+        }}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            security_fixes(&old, &new),
+            "- Fixes GHSA-xp26-3454-mjgp (@vitest/mocker)\n- Fixes GHSA-6pq8-jhm2-2vcw (qs)\n"
+        );
+        assert_eq!(security_fixes(&old, &old), "");
+        assert_eq!(
+            security_fixes(&old, &Packages::new()),
+            "- Fixes GHSA-xp26-3454-mjgp (@vitest/mocker)\n- Fixes GHSA-6pq8-jhm2-2vcw, GHSA-w74x-v6f9-j3xg (qs)\n"
+        );
+    }
 
     #[test]
     fn parses_bundler_sources_platforms_and_direct_dependencies() {

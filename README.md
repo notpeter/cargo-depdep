@@ -26,6 +26,7 @@ Arguments:
 Options:
   --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]
   --all  Include transitive dependency changes
+  --security  List fixed npm security advisories before the table
   --pretty  Align the columns for a nicely formatted ASCII table
   -h, --help    Print help
 ```
@@ -83,6 +84,26 @@ prints a hint to stderr:
 ```
 
 Pass `--all` to include those packages in the table.
+
+### Security fixes (npm)
+
+Pass `--security` to list GitHub security advisories fixed between the selected
+revision and the working tree, before the dependency table:
+
+```console
+# cargo depdep npm --security
+- Fixes GHSA-27r3-jxmh-p828 (body-parser)
+- Fixes GHSA-6pq8-jhm2-2vcw (qs)
+
+| package | old | new |
+| --- | --- | --- |
+| body-parser | 2.2.0 | 2.2.1 |
+```
+
+Requires npm 7 or newer and network access. Uses `npm audit` without changing
+your project, including transitive and development dependencies. The first run
+can be slow; cached metadata speeds up later runs while advisory reports stay
+fresh. Rust and Ruby security reporting is not implemented.
 
 ### Pretty output
 
