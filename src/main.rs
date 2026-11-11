@@ -173,7 +173,7 @@ fn compare_project(
                 } else {
                     rust_audit(&new_lockfile, false)?
                 };
-                security_fixes(&old_advisories, &new_advisories)
+                security_fixes(&old_advisories, &new_advisories, options.fancy)
             }
             Ecosystem::Npm => std::thread::scope(|scope| {
                 let old_audit = scope
@@ -182,7 +182,11 @@ fn compare_project(
                 let old_advisories = old_audit
                     .join()
                     .map_err(|_| Error::Usage("npm audit worker panicked".into()))?;
-                Ok::<_, Error>(security_fixes(&old_advisories?, &new_advisories?))
+                Ok::<_, Error>(security_fixes(
+                    &old_advisories?,
+                    &new_advisories?,
+                    options.fancy,
+                ))
             })?,
             Ecosystem::Ruby => {
                 unreachable!("Ruby security reporting is rejected before comparison")
@@ -245,6 +249,7 @@ struct Options {
     all: bool,
     pretty: bool,
     security: bool,
+    fancy: bool,
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error> {
@@ -261,6 +266,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
     let mut all = false;
     let mut ecosystem = None;
     let mut security = false;
+    let mut fancy = false;
 
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -273,6 +279,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
                        --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]\n  \
                        --all  Include transitive dependency changes\n  \
                        --security  List fixed security advisories before the table\n  \
+                       --fancy  Link advisory IDs in Markdown (requires --security)\n  \
                        --pretty  Align the columns for a nicely formatted ASCII table\n  \
                    -h, --help    Print help"
                 );
@@ -281,6 +288,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
             Some("--pretty") => pretty = true,
             Some("--all") => all = true,
             Some("--security") => security = true,
+            Some("--fancy") => fancy = true,
             Some("rust" | "npm" | "js" | "ts" | "node" | "ruby" | "gem" | "gems") => {
                 if ecosystem.is_some() {
                     return Err(Error::Usage("expected at most one ecosystem".into()));
@@ -313,12 +321,17 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
         }
     }
 
+    if fancy && !security {
+        return Err(Error::Usage("--fancy requires --security".into()));
+    }
+
     Ok(Options {
         ecosystem,
         revision,
         all,
         pretty,
         security,
+        fancy,
     })
 }
 
@@ -1394,13 +1407,26 @@ fn parse_npm_audit(contents: &str) -> Result<Packages, String> {
     Ok(advisories)
 }
 
-fn security_fixes(old: &Packages, new: &Packages) -> String {
+fn advisory_link(id: &str) -> String {
+    let url = if id.starts_with("GHSA-") {
+        format!("https://github.com/advisories/{id}")
+    } else if id.starts_with("CVE-") {
+        format!("https://www.cve.org/CVERecord?id={id}")
+    } else if id.starts_with("RUSTSEC-") {
+        format!("https://rustsec.org/advisories/{id}.html")
+    } else {
+        return id.to_string();
+    };
+    format!("[{id}]({url})")
+}
+
+fn security_fixes(old: &Packages, new: &Packages, fancy: bool) -> String {
     let mut output = String::new();
     for (name, advisories) in old {
         let fixed: Vec<_> = advisories
             .iter()
             .filter(|id| !new.get(name).is_some_and(|current| current.contains(*id)))
-            .cloned()
+            .map(|id| if fancy { advisory_link(id) } else { id.clone() })
             .collect();
         if !fixed.is_empty() {
             output.push_str(&format!("- Fixes {} ({name})\n", fixed.join(", ")));
@@ -2017,6 +2043,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fancy_security_links_advisory_ids() {
+        for (id, url) in [
+            (
+                "GHSA-6pq8-jhm2-2vcw",
+                "https://github.com/advisories/GHSA-6pq8-jhm2-2vcw",
+            ),
+            (
+                "CVE-2020-26235",
+                "https://www.cve.org/CVERecord?id=CVE-2020-26235",
+            ),
+            (
+                "RUSTSEC-2020-0071",
+                "https://rustsec.org/advisories/RUSTSEC-2020-0071.html",
+            ),
+        ] {
+            let old = Packages::from([("package".into(), BTreeSet::from([id.into()]))]);
+            assert_eq!(
+                security_fixes(&old, &Packages::new(), true),
+                format!("- Fixes [{id}]({url}) (package)\n")
+            );
+        }
+        assert!(parse_args([OsString::from("--fancy")]).is_err());
+        let options = parse_args(["--fancy", "--security"].map(OsString::from)).unwrap();
+        assert!(options.fancy && options.security);
+    }
+
+    #[test]
     fn reports_fixed_rust_advisories_without_counting_warnings_or_duplicates() {
         let old = parse_rust_audit(
             r#"{
@@ -2036,7 +2089,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            security_fixes(&old, &new),
+            security_fixes(&old, &new, false),
             "- Fixes RUSTSEC-2020-0071 (time)\n"
         );
         assert!(parse_rust_audit("{}").is_err());
@@ -2067,12 +2120,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            security_fixes(&old, &new),
+            security_fixes(&old, &new, false),
             "- Fixes GHSA-xp26-3454-mjgp (@vitest/mocker)\n- Fixes GHSA-6pq8-jhm2-2vcw (qs)\n"
         );
-        assert_eq!(security_fixes(&old, &old), "");
+        assert_eq!(security_fixes(&old, &old, false), "");
         assert_eq!(
-            security_fixes(&old, &Packages::new()),
+            security_fixes(&old, &Packages::new(), false),
             "- Fixes GHSA-xp26-3454-mjgp (@vitest/mocker)\n- Fixes GHSA-6pq8-jhm2-2vcw, GHSA-w74x-v6f9-j3xg (qs)\n"
         );
     }

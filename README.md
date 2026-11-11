@@ -27,6 +27,7 @@ Options:
   --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]
   --all  Include transitive dependency changes
   --security  List fixed security advisories before the table
+  --fancy  Link advisory IDs in Markdown (requires --security)
   --pretty  Align the columns for a nicely formatted ASCII table
   -h, --help    Print help
 ```
@@ -98,6 +99,12 @@ revision and the working tree, before the dependency table:
 | package | old | new |
 | --- | --- | --- |
 | body-parser | 2.2.0 | 2.2.1 |
+```
+
+Add `--fancy` to link GHSA, CVE, and RUSTSEC IDs to their advisory pages:
+
+```markdown
+- Fixes [GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828) (body-parser)
 ```
 
 For npm, requires npm 7 or newer and network access. Uses `npm audit` without
