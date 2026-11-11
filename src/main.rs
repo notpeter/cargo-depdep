@@ -51,19 +51,14 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
             repository_root.display()
         )));
     }
-    if options.security {
-        for ecosystem in &ecosystems {
-            if !matches!(ecosystem, Ecosystem::Npm) {
-                return Err(Error::Usage(format!(
-                    "--security is not implemented for {}",
-                    match ecosystem {
-                        Ecosystem::Rust => "Rust",
-                        Ecosystem::Ruby => "Ruby",
-                        Ecosystem::Npm => unreachable!(),
-                    }
-                )));
-            }
-        }
+    if options.security
+        && ecosystems
+            .iter()
+            .any(|ecosystem| matches!(ecosystem, Ecosystem::Ruby))
+    {
+        return Err(Error::Usage(
+            "--security is not implemented for Ruby".into(),
+        ));
     }
     let multiple = ecosystems.len() > 1;
     for (index, ecosystem) in ecosystems.into_iter().enumerate() {
@@ -162,22 +157,37 @@ fn compare_project(
     };
     let direct = old_direct.union(&new_direct).cloned().collect();
 
-    if options.security && old_packages != new_packages && !old_packages.is_empty() {
-        let fixes = std::thread::scope(|scope| {
-            let old_audit = scope.spawn(|| {
-                npm_audit(
-                    old_manifest.as_deref().unwrap_or("{}"),
-                    old_lockfile
-                        .as_deref()
-                        .expect("old packages require a lockfile"),
-                )
-            });
-            let new_advisories = npm_audit(&new_manifest, &new_lockfile);
-            let old_advisories = old_audit
-                .join()
-                .map_err(|_| Error::Usage("npm audit worker panicked".into()))?;
-            Ok::<_, Error>(security_fixes(&old_advisories?, &new_advisories?))
-        })?;
+    let security_changed = match ecosystem {
+        Ecosystem::Rust => old_lockfile.as_deref() != Some(new_lockfile.as_str()),
+        _ => old_packages != new_packages,
+    };
+    if options.security && security_changed && !old_packages.is_empty() {
+        let old_lockfile = old_lockfile
+            .as_deref()
+            .expect("old packages require a lockfile");
+        let fixes = match ecosystem {
+            Ecosystem::Rust => {
+                let old_advisories = rust_audit(old_lockfile, true)?;
+                let new_advisories = if old_advisories.is_empty() {
+                    Packages::new()
+                } else {
+                    rust_audit(&new_lockfile, false)?
+                };
+                security_fixes(&old_advisories, &new_advisories)
+            }
+            Ecosystem::Npm => std::thread::scope(|scope| {
+                let old_audit = scope
+                    .spawn(|| npm_audit(old_manifest.as_deref().unwrap_or("{}"), old_lockfile));
+                let new_advisories = npm_audit(&new_manifest, &new_lockfile);
+                let old_advisories = old_audit
+                    .join()
+                    .map_err(|_| Error::Usage("npm audit worker panicked".into()))?;
+                Ok::<_, Error>(security_fixes(&old_advisories?, &new_advisories?))
+            })?,
+            Ecosystem::Ruby => {
+                unreachable!("Ruby security reporting is rejected before comparison")
+            }
+        };
         if !fixes.is_empty() {
             println!("{fixes}");
         }
@@ -262,7 +272,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, Error
                      Options:\n  \
                        --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]\n  \
                        --all  Include transitive dependency changes\n  \
-                       --security  List fixed npm security advisories before the table\n  \
+                       --security  List fixed security advisories before the table\n  \
                        --pretty  Align the columns for a nicely formatted ASCII table\n  \
                    -h, --help    Print help"
                 );
@@ -1209,9 +1219,23 @@ fn inline_toml_field<'a>(
     Ok(None)
 }
 
-// Audit isolated snapshots so neither node_modules nor the working tree can
-// affect the comparison. npm audit does not install packages or execute scripts.
+// Keep audit snapshots outside the project and remove them after use.
 struct AuditDirectory(PathBuf);
+
+impl AuditDirectory {
+    fn create() -> Result<Self, Error> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the Unix epoch")
+            .as_nanos();
+        let path = env::temp_dir().join(format!("cargo-depdep-audit-{}-{nonce}", process::id()));
+        fs::create_dir(&path).map_err(|source| Error::Io {
+            context: "could not create audit directory".into(),
+            source,
+        })?;
+        Ok(Self(path))
+    }
+}
 
 impl Drop for AuditDirectory {
     fn drop(&mut self) {
@@ -1220,16 +1244,7 @@ impl Drop for AuditDirectory {
 }
 
 fn npm_audit(manifest: &str, lockfile: &str) -> Result<Packages, Error> {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock is after the Unix epoch")
-        .as_nanos();
-    let path = env::temp_dir().join(format!("cargo-depdep-audit-{}-{nonce}", process::id()));
-    fs::create_dir(&path).map_err(|source| Error::Io {
-        context: "could not create npm audit directory".into(),
-        source,
-    })?;
-    let directory = AuditDirectory(path);
+    let directory = AuditDirectory::create()?;
     for (name, contents) in [(NPM_MANIFEST, manifest), (NPM_LOCKFILE, lockfile)] {
         fs::write(directory.0.join(name), contents).map_err(|source| Error::Io {
             context: format!("could not write npm audit snapshot {name}"),
@@ -1268,6 +1283,63 @@ fn npm_audit(manifest: &str, lockfile: &str) -> Result<Packages, Error> {
     let report = String::from_utf8(output.stdout)
         .map_err(|_| Error::Usage("npm audit returned non-UTF-8 output".into()))?;
     parse_npm_audit(&report).map_err(|message| Error::Usage(format!("npm audit failed: {message}")))
+}
+
+fn rust_audit(lockfile: &str, fetch: bool) -> Result<Packages, Error> {
+    let directory = AuditDirectory::create()?;
+    let path = directory.0.join(CARGO_LOCKFILE);
+    fs::write(&path, lockfile).map_err(|source| Error::Io {
+        context: "could not write Rust audit snapshot".into(),
+        source,
+    })?;
+    let mut command = Command::new("cargo");
+    command
+        .args(["audit", "--json", "--no-yanked", "--db"])
+        .arg(env::temp_dir().join("cargo-depdep-rustsec-db"))
+        .arg("--file")
+        .arg(&path)
+        .current_dir(&directory.0);
+    if !fetch {
+        command.arg("--no-fetch");
+    }
+    let output = command.output().map_err(|source| Error::Io {
+        context: "could not run cargo audit (install with cargo install cargo-audit)".into(),
+        source,
+    })?;
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(Error::Usage(format!(
+            "cargo audit failed (requires cargo-audit): {}",
+            command_error(&output.stderr)
+        )));
+    }
+    let report = String::from_utf8(output.stdout)
+        .map_err(|_| Error::Usage("cargo audit returned non-UTF-8 output".into()))?;
+    parse_rust_audit(&report)
+        .map_err(|message| Error::Usage(format!("cargo audit failed: {message}")))
+}
+
+fn parse_rust_audit(contents: &str) -> Result<Packages, String> {
+    let json = parse_json(contents)?;
+    let vulnerabilities = json
+        .as_object()
+        .and_then(|root| root.get("vulnerabilities"))
+        .and_then(JsonValue::as_object)
+        .ok_or("missing vulnerabilities object")?;
+    let Some(JsonValue::Array(list)) = vulnerabilities.get("list") else {
+        return Err("missing vulnerabilities list".into());
+    };
+    let mut advisories = Packages::new();
+    for entry in list {
+        let advisory = entry
+            .as_object()
+            .and_then(|entry| entry.get("advisory"))
+            .and_then(JsonValue::as_object)
+            .ok_or("missing advisory object")?;
+        let name = json_string_field(advisory, "package")?.ok_or("missing advisory package")?;
+        let id = json_string_field(advisory, "id")?.ok_or("missing advisory ID")?;
+        advisories.entry(name.into()).or_default().insert(id.into());
+    }
+    Ok(advisories)
 }
 
 fn parse_npm_audit(contents: &str) -> Result<Packages, String> {
@@ -1943,6 +2015,32 @@ impl fmt::Display for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_fixed_rust_advisories_without_counting_warnings_or_duplicates() {
+        let old = parse_rust_audit(
+            r#"{
+            "vulnerabilities":{"list":[
+                {"advisory":{"id":"RUSTSEC-2020-0071","package":"time"}},
+                {"advisory":{"id":"RUSTSEC-2020-0071","package":"time"}},
+                {"advisory":{"id":"RUSTSEC-2023-0071","package":"rsa"}}
+            ]},
+            "warnings":{"unmaintained":[{"advisory":{"id":"RUSTSEC-2021-0145","package":"atty"}}]}
+        }"#,
+        )
+        .unwrap();
+        let new = parse_rust_audit(
+            r#"{"vulnerabilities":{"list":[
+            {"advisory":{"id":"RUSTSEC-2023-0071","package":"rsa"}}
+        ]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            security_fixes(&old, &new),
+            "- Fixes RUSTSEC-2020-0071 (time)\n"
+        );
+        assert!(parse_rust_audit("{}").is_err());
+    }
 
     #[test]
     fn reports_only_fully_resolved_advisories_grouped_by_package() {

@@ -26,7 +26,7 @@ Arguments:
 Options:
   --rev <REV>  Git rev to compare against [default: origin default branch, then local main/master]
   --all  Include transitive dependency changes
-  --security  List fixed npm security advisories before the table
+  --security  List fixed security advisories before the table
   --pretty  Align the columns for a nicely formatted ASCII table
   -h, --help    Print help
 ```
@@ -85,9 +85,9 @@ prints a hint to stderr:
 
 Pass `--all` to include those packages in the table.
 
-### Security fixes (npm)
+### Security fixes
 
-Pass `--security` to list GitHub security advisories fixed between the selected
+Pass `--security` to list security advisories fixed between the selected
 revision and the working tree, before the dependency table:
 
 ```console
@@ -100,10 +100,15 @@ revision and the working tree, before the dependency table:
 | body-parser | 2.2.0 | 2.2.1 |
 ```
 
-Requires npm 7 or newer and network access. Uses `npm audit` without changing
-your project, including transitive and development dependencies. The first run
+For npm, requires npm 7 or newer and network access. Uses `npm audit` without
+changing your project, including transitive and development dependencies. The first run
 can be slow; cached metadata speeds up later runs while advisory reports stay
-fresh. Rust and Ruby security reporting is not implemented.
+fresh.
+
+For Rust, use `cargo depdep rust --security`. Requires `cargo-audit`
+(`cargo install cargo-audit`) and network access. Reports fixed `RUSTSEC` IDs
+using a cached advisory database, including transitive dependencies. Ruby
+security reporting is not implemented.
 
 ### Pretty output
 
