@@ -39,16 +39,24 @@ then `origin/main` or `origin/master`, then local `main` or `master`.
 Remote-tracking branches reflect the last fetch; run `git fetch origin` to update
 them without pulling. Use `--rev <REV>` to choose a revision explicitly.
 
-`cargo depdep` detects `Cargo.toml`, `package.json`, and `Gemfile` from the
-current directory up to the repository root. If multiple are found, it compares each ecosystem in
-separate Rust, npm, and Ruby sections. Each detected ecosystem requires its lockfile.
-Pass `rust`, `npm`, or `ruby` to compare only that ecosystem.
-Ruby also accepts `gem` and `gems` as aliases.
+`cargo depdep` finds lockfiles recursively across the Git repository, including
+new, untracked projects and excluding ignored files. It compares each project
+with the selected revision and skips unchanged dependencies. Under
+`## Package Changes`, results are grouped under their lockfile paths, such as
+`xtask/package-lock.json` and `rfd-processor/package-lock.json`.
+
+Pass `rust`, `npm`, or `ruby` to filter by ecosystem. Ruby also accepts `gem`
+and `gems` as aliases. Discovery covers the whole repository even when run from
+a subdirectory.
 
 For a Rust project:
 
 ```console
 # cargo depdep
+## Package Changes
+
+### Cargo.lock
+
 | crate | old | new |
 | --- | --- | --- |
 | serde | 1.0.217 | 1.0.219 |
@@ -59,6 +67,10 @@ For an npm project, detection works automatically; you can also pass `npm`:
 
 ```console
 # cargo depdep npm
+## Package Changes
+
+### package-lock.json
+
 | package | old | new |
 | --- | --- | --- |
 | eslint | 9.31.0 | 9.33.0 |
@@ -69,6 +81,10 @@ For a Ruby project using Bundler:
 
 ```console
 # cargo depdep ruby
+## Package Changes
+
+### Gemfile.lock
+
 | gem | old | new |
 | --- | --- | --- |
 | asciidoctor | 2.0.23 | 2.0.26 |
@@ -89,12 +105,19 @@ Pass `--all` to include those packages in the table.
 ### Security fixes
 
 Pass `--security` to list security advisories fixed between the selected
-revision and the working tree, before the dependency table:
+revision and the working tree. Fixes from all projects are grouped and deduplicated
+under `## Security updates`, followed by the package changes:
 
 ```console
 # cargo depdep npm --security
+## Security updates
+
 - Fixes GHSA-27r3-jxmh-p828 (body-parser)
 - Fixes GHSA-6pq8-jhm2-2vcw (qs)
+
+## Package Changes
+
+### package-lock.json
 
 | package | old | new |
 | --- | --- | --- |
@@ -132,7 +155,7 @@ Example output:
 
 ## Implementation
 
-The command searches from the current directory toward the repository root. A
+The command uses Git to discover lockfiles throughout the repository. A
 Rust project is identified by `Cargo.toml` and `Cargo.lock`; an npm project uses
 `package.json` and `package-lock.json`; a Ruby project uses `Gemfile` and
 `Gemfile.lock`. The `old` column comes from the selected

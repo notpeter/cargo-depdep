@@ -61,7 +61,7 @@ fn compares_the_working_lockfile_with_a_git_revision() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "| crate | old | new |\n\
+        "## Package Changes\n\n### Cargo.lock\n\n| crate | old | new |\n\
          | --- | --- | --- |\n\
          | added |  | 0.1.0 |\n\
          | foo | 1.0.0, 2.0.0 | 2.0.0, 3.0.0 |\n\
@@ -81,7 +81,7 @@ fn compares_the_working_lockfile_with_a_git_revision() {
     );
     assert_eq!(
         String::from_utf8(pretty.stdout).unwrap(),
-        "| crate   |          old |          new |\n\
+        "## Package Changes\n\n### Cargo.lock\n\n| crate   |          old |          new |\n\
          | :------ | -----------: | -----------: |\n\
          | added   |              |        0.1.0 |\n\
          | foo     | 1.0.0, 2.0.0 | 2.0.0, 3.0.0 |\n\
@@ -150,7 +150,10 @@ fn detects_ecosystems_and_allows_explicit_overrides() {
     assert!(both.status.success());
     assert_eq!(
         String::from_utf8(both.stdout).unwrap(),
-        format!("## Rust\n\n{rust_text}\n## npm\n\n{npm_text}")
+        format!(
+            "{rust_text}\n{}",
+            npm_text.strip_prefix("## Package Changes\n\n").unwrap()
+        )
     );
     for alias in ["js", "ts", "node"] {
         let output = run(&[alias]);
@@ -256,7 +259,7 @@ fn missing_base_files_show_added_dependencies() {
                     assert_eq!(String::from_utf8(output.stderr).unwrap(), "no changes\n");
                 } else {
                     let mut expected = format!(
-                        "| {label} | old | new |\n| --- | --- | --- |\n| added |  | 1.0.0 |\n"
+                        "## Package Changes\n\n### xtask/{lockfile_name}\n\n| {label} | old | new |\n| --- | --- | --- |\n| added |  | 1.0.0 |\n"
                     );
                     if all {
                         expected.push_str("| transitive |  | 2.0.0 |\n");
@@ -341,7 +344,7 @@ fn compares_ruby_direct_and_transitive_changes_from_nested_directories() {
             .output()
             .unwrap()
     };
-    let expected = "| gem | old | new |\n| --- | --- | --- |\n| added |  | 0.1 |\n| removed | 1.0 |  |\n| rouge | 4.6.1 | 5.0.0 |\n";
+    let expected = "## Package Changes\n\n### Gemfile.lock\n\n| gem | old | new |\n| --- | --- | --- |\n| added |  | 0.1 |\n| removed | 1.0 |  |\n| rouge | 4.6.1 | 5.0.0 |\n";
     for args in [&[][..], &["ruby"], &["gem"], &["gems"]] {
         let output = run(args);
         assert!(
@@ -371,14 +374,113 @@ fn compares_ruby_direct_and_transitive_changes_from_nested_directories() {
     .unwrap();
     let multiple = run(&[]);
     assert!(multiple.status.success());
-    assert_eq!(
-        String::from_utf8(multiple.stdout).unwrap(),
-        format!("## npm\n\n\n## Ruby\n\n{expected}")
-    );
+    assert_eq!(String::from_utf8(multiple.stdout).unwrap(), expected);
     fs::remove_file(repository.join("Gemfile.lock")).unwrap();
     let missing = run(&["ruby"]);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("Gemfile and Gemfile.lock"));
+    fs::remove_dir_all(repository).unwrap();
+}
+
+#[test]
+fn compares_nested_lockfiles_and_skips_unchanged_and_ignored_projects() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let repository = std::env::temp_dir().join(format!(
+        "cargo-depdep-recursive-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&repository).unwrap();
+    git(&repository, &["init", "--quiet"]);
+    fs::write(repository.join(".gitignore"), "node_modules/\n").unwrap();
+    fs::write(repository.join("Cargo.toml"), manifest(&["unchanged"])).unwrap();
+    fs::write(
+        repository.join("Cargo.lock"),
+        lockfile(&[("unchanged", "1.0.0")]),
+    )
+    .unwrap();
+    let old = r#"{"lockfileVersion":3,"packages":{"node_modules/foo":{"version":"1.0.0"}}}"#;
+    for directory in ["xtask", "rfd-processor", "node_modules/ignored"] {
+        let directory = repository.join(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("package.json"),
+            r#"{"dependencies":{"foo":"*"}}"#,
+        )
+        .unwrap();
+        fs::write(directory.join("package-lock.json"), old).unwrap();
+    }
+    git(&repository, &["add", "."]);
+    let revision = tree(&repository);
+    for directory in ["xtask", "rfd-processor"] {
+        fs::write(
+            repository.join(directory).join("package-lock.json"),
+            old.replace("1.0.0", "2.0.0"),
+        )
+        .unwrap();
+    }
+    // This new project must be found before its files have been staged.
+    fs::create_dir(repository.join("new")).unwrap();
+    fs::write(
+        repository.join("new/package.json"),
+        r#"{"dependencies":{"foo":"*"}}"#,
+    )
+    .unwrap();
+    fs::write(repository.join("new/package-lock.json"), old).unwrap();
+    let run = |directory: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cargo-depdep"))
+            .args(["--rev", &revision])
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap()
+    };
+    let output = run(&repository, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout.clone()).unwrap();
+    let headings: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("### "))
+        .collect();
+    assert_eq!(
+        headings,
+        [
+            "### new/package-lock.json",
+            "### rfd-processor/package-lock.json",
+            "### xtask/package-lock.json"
+        ]
+    );
+    assert!(output.stderr.is_empty());
+    let nested = run(&repository.join("xtask"), &["npm", "--all"]);
+    assert!(nested.status.success());
+    assert_eq!(nested.stdout, output.stdout);
+    let rust = run(&repository, &["rust"]);
+    assert!(rust.status.success());
+    assert!(rust.stdout.is_empty());
+    assert_eq!(String::from_utf8(rust.stderr).unwrap(), "no changes\n");
+    // An unchanged Ruby project should not block security checks elsewhere.
+    fs::write(repository.join("Gemfile"), "").unwrap();
+    fs::write(repository.join("Gemfile.lock"), gem_lockfile(&[], &[])).unwrap();
+    git(&repository, &["add", "."]);
+    let unchanged = tree(&repository);
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-depdep"))
+        .args(["--rev", &unchanged, "--security"])
+        .current_dir(&repository)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "no changes\n");
     fs::remove_dir_all(repository).unwrap();
 }
 

@@ -32,69 +32,96 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
         Some(revision) => revision.clone(),
         None => default_revision(&repository_root),
     };
-    let ecosystems = match options.ecosystem {
-        Some(ecosystem) => vec![ecosystem],
-        None => [
-            (Ecosystem::Rust, CARGO_MANIFEST),
-            (Ecosystem::Npm, NPM_MANIFEST),
-            (Ecosystem::Ruby, RUBY_MANIFEST),
-        ]
-        .into_iter()
-        .filter(|(_, manifest)| find_file(&current_dir, &repository_root, manifest).is_some())
-        .map(|(ecosystem, _)| ecosystem)
-        .collect(),
-    };
-    if ecosystems.is_empty() {
-        return Err(Error::Usage(format!(
-            "could not find Cargo.toml or package.json or Gemfile between {} and {}",
-            current_dir.display(),
-            repository_root.display()
-        )));
-    }
-    if options.security
-        && ecosystems
-            .iter()
-            .any(|ecosystem| matches!(ecosystem, Ecosystem::Ruby))
-    {
-        return Err(Error::Usage(
-            "--security is not implemented for Ruby".into(),
-        ));
-    }
-    let multiple = ecosystems.len() > 1;
-    for (index, ecosystem) in ecosystems.into_iter().enumerate() {
-        if multiple {
-            if index > 0 {
-                println!();
-            }
-            println!(
-                "## {}",
-                match ecosystem {
-                    Ecosystem::Rust => "Rust",
-                    Ecosystem::Npm => "npm",
-                    Ecosystem::Ruby => "Ruby",
-                }
-            );
-            println!();
+    let projects = discover_projects(&repository_root, options.ecosystem)?;
+    let projects = if projects.is_empty() {
+        // Preserve useful missing-project/lockfile errors for explicit selections
+        // and invocations from a manifest directory.
+        let ecosystems = match options.ecosystem {
+            Some(ecosystem) => vec![ecosystem],
+            None => [
+                (Ecosystem::Rust, CARGO_MANIFEST),
+                (Ecosystem::Npm, NPM_MANIFEST),
+                (Ecosystem::Ruby, RUBY_MANIFEST),
+            ]
+            .into_iter()
+            .filter(|(_, manifest)| find_file(&current_dir, &repository_root, manifest).is_some())
+            .map(|(ecosystem, _)| ecosystem)
+            .collect(),
+        };
+        if ecosystems.is_empty() {
+            return Err(Error::Usage(format!(
+                "could not find Cargo.toml or package.json or Gemfile in {}",
+                repository_root.display()
+            )));
         }
-        compare_project(
-            &current_dir,
-            &repository_root,
-            &revision,
-            ecosystem,
-            &options,
-        )?;
+        ecosystems
+            .into_iter()
+            .map(|ecosystem| find_project(&current_dir, &repository_root, ecosystem))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        projects
+    };
+    let mut comparisons = Vec::new();
+    let mut fixes = Packages::new();
+    for project in &projects {
+        if let Some(comparison) = compare_project(project, &repository_root, &revision, &options)? {
+            for (name, ids) in &comparison.fixes {
+                fixes
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(ids.iter().cloned());
+            }
+            comparisons.push(comparison);
+        }
+    }
+    if comparisons.is_empty() {
+        eprintln!("no changes");
+        return Ok(());
+    }
+    if !fixes.is_empty() {
+        println!(
+            "## Security updates\n\n{}",
+            security_fixes(&fixes, &Packages::new(), options.fancy)
+        );
+    }
+    let mut package_heading = false;
+    for comparison in comparisons {
+        if comparison.old == comparison.new {
+            continue;
+        }
+        if !package_heading {
+            println!("## Package Changes");
+            package_heading = true;
+        }
+        println!("\n### {}\n", comparison.lockfile.display());
+        print_diff(
+            &comparison.old,
+            &comparison.new,
+            &comparison.direct,
+            options.all,
+            options.pretty,
+            comparison.ecosystem.package_label(),
+        );
     }
     Ok(())
 }
 
+struct Comparison {
+    lockfile: PathBuf,
+    ecosystem: Ecosystem,
+    old: Packages,
+    new: Packages,
+    direct: BTreeSet<String>,
+    fixes: Packages,
+}
+
 fn compare_project(
-    current_dir: &Path,
+    project: &Project,
     repository_root: &Path,
     revision: &str,
-    ecosystem: Ecosystem,
     options: &Options,
-) -> Result<(), Error> {
-    let project = find_project(current_dir, repository_root, ecosystem)?;
+) -> Result<Option<Comparison>, Error> {
+    let ecosystem = project.ecosystem;
     let lockfile_path = project
         .lockfile
         .strip_prefix(repository_root)
@@ -109,6 +136,14 @@ fn compare_project(
         context: format!("could not read {}", project.lockfile.display()),
         source,
     })?;
+    if old_lockfile.as_deref() == Some(new_lockfile.as_str()) {
+        return Ok(None);
+    }
+    if options.security && matches!(ecosystem, Ecosystem::Ruby) {
+        return Err(Error::Usage(
+            "--security is not implemented for Ruby".into(),
+        ));
+    }
     let old_manifest = optional_file_at_revision(repository_root, revision, manifest_path)?;
     let new_manifest = fs::read_to_string(&project.manifest).map_err(|source| Error::Io {
         context: format!("could not read {}", project.manifest.display()),
@@ -131,6 +166,9 @@ fn compare_project(
                 label: project.lockfile.display().to_string(),
                 message,
             })?;
+    if old_packages == new_packages && !options.security {
+        return Ok(None);
+    }
     let (old_direct, new_direct) = if matches!(ecosystem, Ecosystem::Ruby) {
         // Gemfiles are executable Ruby. Bundler already records their direct
         // dependencies in the lockfile, including groups and non-default sources.
@@ -161,11 +199,11 @@ fn compare_project(
         Ecosystem::Rust => old_lockfile.as_deref() != Some(new_lockfile.as_str()),
         _ => old_packages != new_packages,
     };
-    if options.security && security_changed && !old_packages.is_empty() {
+    let fixes = if options.security && security_changed && !old_packages.is_empty() {
         let old_lockfile = old_lockfile
             .as_deref()
             .expect("old packages require a lockfile");
-        let fixes = match ecosystem {
+        match ecosystem {
             Ecosystem::Rust => {
                 let old_advisories = rust_audit(old_lockfile, true)?;
                 let new_advisories = if old_advisories.is_empty() {
@@ -173,7 +211,7 @@ fn compare_project(
                 } else {
                     rust_audit(&new_lockfile, false)?
                 };
-                security_fixes(&old_advisories, &new_advisories, options.fancy)
+                fixed_advisories(&old_advisories, &new_advisories)
             }
             Ecosystem::Npm => std::thread::scope(|scope| {
                 let old_audit = scope
@@ -182,33 +220,29 @@ fn compare_project(
                 let old_advisories = old_audit
                     .join()
                     .map_err(|_| Error::Usage("npm audit worker panicked".into()))?;
-                Ok::<_, Error>(security_fixes(
-                    &old_advisories?,
-                    &new_advisories?,
-                    options.fancy,
-                ))
+                Ok::<_, Error>(fixed_advisories(&old_advisories?, &new_advisories?))
             })?,
             Ecosystem::Ruby => {
                 unreachable!("Ruby security reporting is rejected before comparison")
             }
-        };
-        if !fixes.is_empty() {
-            println!("{fixes}");
         }
+    } else {
+        Packages::new()
+    };
+    if old_packages == new_packages && fixes.is_empty() {
+        return Ok(None);
     }
-
-    print_diff(
-        &old_packages,
-        &new_packages,
-        &direct,
-        options.all,
-        options.pretty,
-        ecosystem.package_label(),
-    );
-    Ok(())
+    Ok(Some(Comparison {
+        lockfile: lockfile_path.to_path_buf(),
+        ecosystem,
+        old: old_packages,
+        new: new_packages,
+        direct,
+        fixes,
+    }))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Ecosystem {
     Rust,
     Npm,
@@ -400,8 +434,63 @@ fn git_line(repository_root: &Path, args: &[&str]) -> Option<String> {
 }
 
 struct Project {
+    ecosystem: Ecosystem,
     manifest: PathBuf,
     lockfile: PathBuf,
+}
+
+fn discover_projects(root: &Path, selected: Option<Ecosystem>) -> Result<Vec<Project>, Error> {
+    // Git avoids walking build output, node_modules, and other ignored trees,
+    // while including new projects that have not been staged yet.
+    let output = Command::new("git")
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "-z",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|source| Error::Io {
+            context: "could not discover dependency lockfiles".into(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::Git(command_error(&output.stderr)));
+    }
+    let files = String::from_utf8(output.stdout)
+        .map_err(|_| Error::Git("lockfile path is not valid UTF-8".into()))?;
+    let files: BTreeSet<_> = files.split('\0').filter(|path| !path.is_empty()).collect();
+    let mut projects = Vec::new();
+    for (ecosystem, lockfile_name, manifest_name) in [
+        (Ecosystem::Rust, CARGO_LOCKFILE, CARGO_MANIFEST),
+        (Ecosystem::Npm, NPM_LOCKFILE, NPM_MANIFEST),
+        (Ecosystem::Ruby, RUBY_LOCKFILE, RUBY_MANIFEST),
+    ] {
+        if selected.is_some_and(|selected| selected != ecosystem) {
+            continue;
+        }
+        for file in &files {
+            let lockfile = root.join(file);
+            if lockfile
+                .file_name()
+                .is_none_or(|name| name != lockfile_name)
+                || !lockfile.is_file()
+            {
+                continue;
+            }
+            if let Some(manifest) = find_file(lockfile.parent().unwrap(), root, manifest_name) {
+                projects.push(Project {
+                    ecosystem,
+                    manifest,
+                    lockfile,
+                });
+            }
+        }
+    }
+    Ok(projects)
 }
 
 fn find_project(
@@ -418,7 +507,11 @@ fn find_project(
     let lockfile = find_file(current_dir, repository_root, lockfile_name);
 
     match (manifest, lockfile) {
-        (Some(manifest), Some(lockfile)) => Ok(Project { manifest, lockfile }),
+        (Some(manifest), Some(lockfile)) => Ok(Project {
+            ecosystem,
+            manifest,
+            lockfile,
+        }),
         _ => Err(Error::Usage(format!(
             "could not find {} between {} and {}",
             ecosystem.project_files(),
@@ -1420,17 +1513,29 @@ fn advisory_link(id: &str) -> String {
     format!("[{id}]({url})")
 }
 
-fn security_fixes(old: &Packages, new: &Packages, fancy: bool) -> String {
-    let mut output = String::new();
+fn fixed_advisories(old: &Packages, new: &Packages) -> Packages {
+    let mut fixes = Packages::new();
     for (name, advisories) in old {
-        let fixed: Vec<_> = advisories
+        let fixed: BTreeSet<_> = advisories
             .iter()
             .filter(|id| !new.get(name).is_some_and(|current| current.contains(*id)))
-            .map(|id| if fancy { advisory_link(id) } else { id.clone() })
+            .cloned()
             .collect();
         if !fixed.is_empty() {
-            output.push_str(&format!("- Fixes {} ({name})\n", fixed.join(", ")));
+            fixes.insert(name.clone(), fixed);
         }
+    }
+    fixes
+}
+
+fn security_fixes(old: &Packages, new: &Packages, fancy: bool) -> String {
+    let mut output = String::new();
+    for (name, advisories) in fixed_advisories(old, new) {
+        let ids: Vec<_> = advisories
+            .into_iter()
+            .map(|id| if fancy { advisory_link(&id) } else { id })
+            .collect();
+        output.push_str(&format!("- Fixes {} ({name})\n", ids.join(", ")));
     }
     output
 }
