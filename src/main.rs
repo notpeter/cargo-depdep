@@ -62,14 +62,15 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
         projects
     };
     let mut comparisons = Vec::new();
-    let mut fixes = Packages::new();
+    let mut fixes = Advisories::new();
     for project in &projects {
         if let Some(comparison) = compare_project(project, &repository_root, &revision, &options)? {
-            for (name, ids) in &comparison.fixes {
-                fixes
-                    .entry(name.clone())
-                    .or_default()
-                    .extend(ids.iter().cloned());
+            for (name, advisories) in &comparison.fixes {
+                fixes.entry(name.clone()).or_default().extend(
+                    advisories
+                        .iter()
+                        .map(|(id, advisory)| (id.clone(), advisory.clone())),
+                );
             }
             comparisons.push(comparison);
         }
@@ -81,7 +82,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
     if !fixes.is_empty() {
         println!(
             "## Security updates\n\n{}",
-            security_fixes(&fixes, &Packages::new(), options.fancy)
+            security_fixes(&fixes, &Advisories::new(), options.fancy)
         );
     }
     let mut package_heading = false;
@@ -112,7 +113,7 @@ struct Comparison {
     old: Packages,
     new: Packages,
     direct: BTreeSet<String>,
-    fixes: Packages,
+    fixes: Advisories,
 }
 
 fn compare_project(
@@ -207,7 +208,7 @@ fn compare_project(
             Ecosystem::Rust => {
                 let old_advisories = rust_audit(old_lockfile, true)?;
                 let new_advisories = if old_advisories.is_empty() {
-                    Packages::new()
+                    Advisories::new()
                 } else {
                     rust_audit(&new_lockfile, false)?
                 };
@@ -227,7 +228,7 @@ fn compare_project(
             }
         }
     } else {
-        Packages::new()
+        Advisories::new()
     };
     if old_packages == new_packages && fixes.is_empty() {
         return Ok(None);
@@ -604,6 +605,13 @@ fn command_error(stderr: &[u8]) -> String {
 }
 
 type Packages = BTreeMap<String, BTreeSet<String>>;
+type Advisories = BTreeMap<String, BTreeMap<String, Advisory>>;
+
+#[derive(Clone)]
+struct Advisory {
+    title: String,
+    ghsa_ids: BTreeSet<String>,
+}
 
 // Read only resolved specs and top-level declarations, not nested requirements,
 // checksums, platform lists, or the Bundler/Ruby versions.
@@ -1349,7 +1357,7 @@ impl Drop for AuditDirectory {
     }
 }
 
-fn npm_audit(manifest: &str, lockfile: &str) -> Result<Packages, Error> {
+fn npm_audit(manifest: &str, lockfile: &str) -> Result<Advisories, Error> {
     let directory = AuditDirectory::create()?;
     for (name, contents) in [(NPM_MANIFEST, manifest), (NPM_LOCKFILE, lockfile)] {
         fs::write(directory.0.join(name), contents).map_err(|source| Error::Io {
@@ -1391,7 +1399,7 @@ fn npm_audit(manifest: &str, lockfile: &str) -> Result<Packages, Error> {
     parse_npm_audit(&report).map_err(|message| Error::Usage(format!("npm audit failed: {message}")))
 }
 
-fn rust_audit(lockfile: &str, fetch: bool) -> Result<Packages, Error> {
+fn rust_audit(lockfile: &str, fetch: bool) -> Result<Advisories, Error> {
     let directory = AuditDirectory::create()?;
     let path = directory.0.join(CARGO_LOCKFILE);
     fs::write(&path, lockfile).map_err(|source| Error::Io {
@@ -1424,7 +1432,7 @@ fn rust_audit(lockfile: &str, fetch: bool) -> Result<Packages, Error> {
         .map_err(|message| Error::Usage(format!("cargo audit failed: {message}")))
 }
 
-fn parse_rust_audit(contents: &str) -> Result<Packages, String> {
+fn parse_rust_audit(contents: &str) -> Result<Advisories, String> {
     let json = parse_json(contents)?;
     let vulnerabilities = json
         .as_object()
@@ -1434,7 +1442,7 @@ fn parse_rust_audit(contents: &str) -> Result<Packages, String> {
     let Some(JsonValue::Array(list)) = vulnerabilities.get("list") else {
         return Err("missing vulnerabilities list".into());
     };
-    let mut advisories = Packages::new();
+    let mut advisories = Advisories::new();
     for entry in list {
         let advisory = entry
             .as_object()
@@ -1443,12 +1451,34 @@ fn parse_rust_audit(contents: &str) -> Result<Packages, String> {
             .ok_or("missing advisory object")?;
         let name = json_string_field(advisory, "package")?.ok_or("missing advisory package")?;
         let id = json_string_field(advisory, "id")?.ok_or("missing advisory ID")?;
-        advisories.entry(name.into()).or_default().insert(id.into());
+        let title = json_string_field(advisory, "title")?.unwrap_or_default();
+        let mut ghsa_ids = BTreeSet::new();
+        match advisory.get("aliases") {
+            None => {}
+            Some(JsonValue::Array(aliases)) => {
+                for alias in aliases {
+                    let JsonValue::String(alias) = alias else {
+                        return Err("expected an advisory alias string".into());
+                    };
+                    if alias.starts_with("GHSA-") && alias != id {
+                        ghsa_ids.insert(alias.clone());
+                    }
+                }
+            }
+            Some(_) => return Err("expected an advisory aliases array".into()),
+        }
+        advisories.entry(name.into()).or_default().insert(
+            id.into(),
+            Advisory {
+                title: title.into(),
+                ghsa_ids,
+            },
+        );
     }
     Ok(advisories)
 }
 
-fn parse_npm_audit(contents: &str) -> Result<Packages, String> {
+fn parse_npm_audit(contents: &str) -> Result<Advisories, String> {
     let json = parse_json(contents)?;
     let root = json.as_object().ok_or("expected an audit report object")?;
     if let Some(error) = root.get("error") {
@@ -1464,7 +1494,7 @@ fn parse_npm_audit(contents: &str) -> Result<Packages, String> {
         .get("vulnerabilities")
         .and_then(JsonValue::as_object)
         .ok_or("missing vulnerabilities object (npm 7 or newer is required)")?;
-    let mut advisories = Packages::new();
+    let mut advisories = Advisories::new();
     for vulnerability in vulnerabilities.values() {
         let record = vulnerability
             .as_object()
@@ -1493,7 +1523,14 @@ fn parse_npm_audit(contents: &str) -> Result<Packages, String> {
                             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
                 })
             {
-                advisories.entry(name.into()).or_default().insert(id.into());
+                let title = json_string_field(advisory, "title")?.unwrap_or_default();
+                advisories.entry(name.into()).or_default().insert(
+                    id.into(),
+                    Advisory {
+                        title: title.into(),
+                        ghsa_ids: BTreeSet::new(),
+                    },
+                );
             }
         }
     }
@@ -1513,13 +1550,16 @@ fn advisory_link(id: &str) -> String {
     format!("[{id}]({url})")
 }
 
-fn fixed_advisories(old: &Packages, new: &Packages) -> Packages {
-    let mut fixes = Packages::new();
+fn fixed_advisories(old: &Advisories, new: &Advisories) -> Advisories {
+    let mut fixes = Advisories::new();
     for (name, advisories) in old {
-        let fixed: BTreeSet<_> = advisories
+        let fixed: BTreeMap<_, _> = advisories
             .iter()
-            .filter(|id| !new.get(name).is_some_and(|current| current.contains(*id)))
-            .cloned()
+            .filter(|(id, _)| {
+                !new.get(name)
+                    .is_some_and(|current| current.contains_key(*id))
+            })
+            .map(|(id, advisory)| (id.clone(), advisory.clone()))
             .collect();
         if !fixed.is_empty() {
             fixes.insert(name.clone(), fixed);
@@ -1528,14 +1568,28 @@ fn fixed_advisories(old: &Packages, new: &Packages) -> Packages {
     fixes
 }
 
-fn security_fixes(old: &Packages, new: &Packages, fancy: bool) -> String {
+fn security_fixes(old: &Advisories, new: &Advisories, fancy: bool) -> String {
     let mut output = String::new();
     for (name, advisories) in fixed_advisories(old, new) {
-        let ids: Vec<_> = advisories
-            .into_iter()
-            .map(|id| if fancy { advisory_link(&id) } else { id })
-            .collect();
-        output.push_str(&format!("- Fixes {} ({name})\n", ids.join(", ")));
+        for (id, advisory) in advisories {
+            let ids = advisory
+                .ghsa_ids
+                .iter()
+                .chain(std::iter::once(&id))
+                .map(|id| if fancy { advisory_link(id) } else { id.clone() })
+                .collect::<Vec<_>>()
+                .join(" ");
+            output.push_str(&format!("- Fixes {ids} ({name})\n"));
+            // Keep titles on a single indented line, even if the report contains newlines.
+            let title = advisory
+                .title
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !title.is_empty() {
+                output.push_str(&format!("  {title}\n"));
+            }
+        }
     }
     output
 }
@@ -2163,10 +2217,19 @@ mod tests {
                 "https://rustsec.org/advisories/RUSTSEC-2020-0071.html",
             ),
         ] {
-            let old = Packages::from([("package".into(), BTreeSet::from([id.into()]))]);
+            let old = Advisories::from([(
+                "package".into(),
+                BTreeMap::from([(
+                    id.into(),
+                    Advisory {
+                        title: "Advisory title".into(),
+                        ghsa_ids: BTreeSet::new(),
+                    },
+                )]),
+            )]);
             assert_eq!(
-                security_fixes(&old, &Packages::new(), true),
-                format!("- Fixes [{id}]({url}) (package)\n")
+                security_fixes(&old, &Advisories::new(), true),
+                format!("- Fixes [{id}]({url}) (package)\n  Advisory title\n")
             );
         }
         assert!(parse_args([OsString::from("--fancy")]).is_err());
@@ -2179,8 +2242,8 @@ mod tests {
         let old = parse_rust_audit(
             r#"{
             "vulnerabilities":{"list":[
-                {"advisory":{"id":"RUSTSEC-2020-0071","package":"time"}},
-                {"advisory":{"id":"RUSTSEC-2020-0071","package":"time"}},
+                {"advisory":{"id":"RUSTSEC-2020-0071","package":"time","title":"Potential segfault in localtime_r invocations"}},
+                {"advisory":{"id":"RUSTSEC-2020-0071","package":"time","title":"Potential segfault in localtime_r invocations"}},
                 {"advisory":{"id":"RUSTSEC-2023-0071","package":"rsa"}}
             ]},
             "warnings":{"unmaintained":[{"advisory":{"id":"RUSTSEC-2021-0145","package":"atty"}}]}
@@ -2195,19 +2258,48 @@ mod tests {
         .unwrap();
         assert_eq!(
             security_fixes(&old, &new, false),
-            "- Fixes RUSTSEC-2020-0071 (time)\n"
+            "- Fixes RUSTSEC-2020-0071 (time)\n  Potential segfault in localtime_r invocations\n"
         );
         assert!(parse_rust_audit("{}").is_err());
     }
 
     #[test]
-    fn reports_only_fully_resolved_advisories_grouped_by_package() {
+    fn rust_advisory_ghsa_aliases_precede_primary_id() {
+        let old = parse_rust_audit(
+            r#"{"vulnerabilities":{"list":[{"advisory":{
+                "id":"RUSTSEC-2026-0347",
+                "package":"rustls",
+                "title":"Buffered application data sent to outer server after ECH rejection",
+                "aliases":["GHSA-vp88-798v-h67f","GHSA-vp88-798v-h67f","CVE-2026-12345"]
+            }}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            security_fixes(&old, &Advisories::new(), false),
+            "- Fixes GHSA-vp88-798v-h67f RUSTSEC-2026-0347 (rustls)\n  Buffered application data sent to outer server after ECH rejection\n"
+        );
+        assert_eq!(
+            security_fixes(&old, &Advisories::new(), true),
+            "- Fixes [GHSA-vp88-798v-h67f](https://github.com/advisories/GHSA-vp88-798v-h67f) [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347.html) (rustls)\n  Buffered application data sent to outer server after ECH rejection\n"
+        );
+        // Alias changes alone do not mean the vulnerability was fixed.
+        let new = parse_rust_audit(
+            r#"{"vulnerabilities":{"list":[{"advisory":{
+                "id":"RUSTSEC-2026-0347","package":"rustls"
+            }}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(security_fixes(&old, &new, false), "");
+    }
+
+    #[test]
+    fn reports_only_fully_resolved_advisories_one_per_bullet() {
         let old = parse_npm_audit(
             r#"{"vulnerabilities": {
             "dependent": {"via": ["qs"]},
             "qs": {"via": [
-                {"name":"qs","url":"https://github.com/advisories/GHSA-6pq8-jhm2-2vcw"},
-                {"name":"qs","url":"https://github.com/advisories/GHSA-6pq8-jhm2-2vcw"},
+                {"name":"qs","url":"https://github.com/advisories/GHSA-6pq8-jhm2-2vcw","title":"qs: prototype\n pollution"},
+                {"name":"qs","url":"https://github.com/advisories/GHSA-6pq8-jhm2-2vcw","title":"qs: prototype\n pollution"},
                 {"name":"qs","url":"https://github.com/advisories/GHSA-w74x-v6f9-j3xg"}
             ]},
             "@vitest/mocker": {"via": [
@@ -2226,12 +2318,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             security_fixes(&old, &new, false),
-            "- Fixes GHSA-xp26-3454-mjgp (@vitest/mocker)\n- Fixes GHSA-6pq8-jhm2-2vcw (qs)\n"
+            "- Fixes GHSA-xp26-3454-mjgp (@vitest/mocker)\n- Fixes GHSA-6pq8-jhm2-2vcw (qs)\n  qs: prototype pollution\n"
         );
         assert_eq!(security_fixes(&old, &old, false), "");
         assert_eq!(
-            security_fixes(&old, &Packages::new(), false),
-            "- Fixes GHSA-xp26-3454-mjgp (@vitest/mocker)\n- Fixes GHSA-6pq8-jhm2-2vcw, GHSA-w74x-v6f9-j3xg (qs)\n"
+            security_fixes(&old, &Advisories::new(), false),
+            "- Fixes GHSA-xp26-3454-mjgp (@vitest/mocker)\n- Fixes GHSA-6pq8-jhm2-2vcw (qs)\n  qs: prototype pollution\n- Fixes GHSA-w74x-v6f9-j3xg (qs)\n"
         );
     }
 

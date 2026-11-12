@@ -106,14 +106,17 @@ Pass `--all` to include those packages in the table.
 
 Pass `--security` to list security advisories fixed between the selected
 revision and the working tree. Fixes from all projects are grouped and deduplicated
-under `## Security updates`, followed by the package changes:
+under `## Security updates`, with one bullet per advisory and its title on the
+following indented line, followed by the package changes:
 
 ```console
 # cargo depdep npm --security
 ## Security updates
 
 - Fixes GHSA-27r3-jxmh-p828 (body-parser)
+  body-parser: denial of service when URL encoding is used
 - Fixes GHSA-6pq8-jhm2-2vcw (qs)
+  qs: prototype pollution
 
 ## Package Changes
 
@@ -128,6 +131,7 @@ Add `--fancy` to link GHSA, CVE, and RUSTSEC IDs to their advisory pages:
 
 ```markdown
 - Fixes [GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828) (body-parser)
+  body-parser: denial of service when URL encoding is used
 ```
 
 For npm, requires npm 7 or newer and network access. Uses `npm audit` without
@@ -136,9 +140,16 @@ can be slow; cached metadata speeds up later runs while advisory reports stay
 fresh.
 
 For Rust, use `cargo depdep rust --security`. Requires `cargo-audit`
-(`cargo install cargo-audit`) and network access. Reports fixed `RUSTSEC` IDs
-using a cached advisory database, including transitive dependencies. Ruby
-security reporting is not implemented.
+(`cargo install cargo-audit`) and network access. Reports fixed advisories
+using a cached advisory database, including transitive dependencies. GHSA aliases,
+when available, appear before the RUSTSEC ID; `--fancy` links each ID:
+
+```console
+- Fixes GHSA-vp88-798v-h67f RUSTSEC-2026-0347 (rustls)
+  Buffered application data sent to outer server after ECH rejection
+```
+
+Ruby security reporting is not implemented.
 
 ### Pretty output
 
